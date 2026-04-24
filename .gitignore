@@ -1,0 +1,33 @@
+# CLAUDE.md for development
+CLAUDE.md
+# DeepENDO for reference
+DeepENDO/
+# Data manifests
+data/*.files
+# Data files
+data/sample_images/
+data/images/*
+data/genetics/*
+data/covariates/*
+data/logs/*
+data/plinks/*
+data/*
+# Logs
+logs/*
+# Output directories
+out/*/
+# Method comparisons
+ContIG/
+train_contig.py
+eval_contig.py
+train_dcca.py
+train_dcca.sh
+eval_dcca_latents.py
+# Writing files
+._*
+# Evaluation files
+eval/
+.snakemake
+plots/
+# Local experimentation
+scratch/
