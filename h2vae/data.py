@@ -87,9 +87,10 @@ class ImageFileDataset(Dataset):
 class NiftiFileDataset(Dataset):
     """Torch dataset that streams NIFTI volumes from disk.
 
-    Each call to ``__getitem__`` loads a ``.nii`` or ``.nii.gz`` file via
-    nibabel, z-score normalises non-zero voxels, and zero-pads to a cubic
-    ``target_size``.  Returns a ``(1, D, H, W)`` float32 tensor.
+    Each call to ``__getitem__`` loads a ``.nii``, ``.nii.gz``, or
+    ``.nii.zst`` file via nibabel, z-score normalises non-zero voxels, and
+    zero-pads to a cubic ``target_size``.  Returns a ``(1, D, H, W)``
+    float32 tensor.
 
     Args:
         paths: List of file paths to NIFTI files.
