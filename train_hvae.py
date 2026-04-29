@@ -644,12 +644,7 @@ def train_epoch(
     epoch_mse = 0.0
     epoch_loss = 0.0
 
-    # Debug per-minibatch logging in genetic-correlation mode (NaNs are easy to
-    # introduce here, so trace both the composite loss and the gc-loss term).
-    debug_gc = cfg.genetic_correlation is not None
-    n_batches = len(train_loader)
-
-    for batch_i, data in enumerate(train_loader):
+    for data in train_loader:
         Z = Z.detach()
         y = data[0].to(device)
         idxs = data[-1]
@@ -675,17 +670,6 @@ def train_epoch(
             vae_loss, zs, Z, her_loss_fn, h_state.hweights, vae.K, weights,
             idxs=idxs,
         )
-
-        if debug_gc:
-            logging.info(
-                "  epoch %d batch %d/%d: loss=%.4g mse=%.4g kld=%.4g her_loss=%s pen=%.4g",
-                epoch, batch_i + 1, n_batches,
-                loss.item(),
-                mse.sum().item(),
-                kld.sum().item(),
-                f"{metrics['her_loss']:.4g}" if "her_loss" in metrics else "n/a",
-                metrics.get("pen_term", float("nan")),
-            )
 
         optimizer.zero_grad()
         loss.backward()
