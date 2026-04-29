@@ -361,6 +361,27 @@ def load_data(
     if n == 0:
         raise ValueError("Inner join produced zero samples — no IDs shared across all files")
 
+    # --- Drop IDs with NaN in the target phenotype ---
+    # The target phenotype drives the gc loss, so any NaN there is fatal;
+    # silently dropping those samples is the only sensible behaviour.
+    if has_target_phenotype:
+        id_to_tp_row = {v: i for i, v in enumerate(tp_ids)}
+        tp_rows = np.array([id_to_tp_row[i] for i in common_ids])
+        tp_subset = tp_raw[tp_rows]
+        keep_mask = ~np.isnan(tp_subset).any(axis=1)
+        dropped = int((~keep_mask).sum())
+        if dropped:
+            print(
+                f"load_data: dropped {dropped} samples with NaN in target phenotype "
+                f"(kept {int(keep_mask.sum())} of {len(common_ids)})"
+            )
+            common_ids = common_ids[keep_mask]
+            n = len(common_ids)
+        if n == 0:
+            raise ValueError(
+                "All samples dropped — every joined sample has NaN in the target phenotype"
+            )
+
     # --- Drop IDs with NaN in required covariate columns ---
     if required_covariates:
         if not has_covariates:

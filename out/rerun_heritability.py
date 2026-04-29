@@ -2,10 +2,16 @@
 
 Reads saved latents (``<outdir>/latents/Zm_{train,val}.{epoch:05d}.txt``) and
 the split IDs (``<outdir>/train_ids.npy``, ``val_ids.npy``), builds heritability
-estimators against a new ``--genetics`` input, and prints log lines in the
+estimators against a new ``--genetics`` input, and writes log lines in the
 format consumed by ``out/plot_heritability.py``.
 
 No VAE forward pass — the trained latents are taken as given.
+
+Default output path is ``<outdir>/log.<genetics>[.<target>].txt``, where
+``<genetics>`` is the basename of ``--genetics`` (with ``.hdf5`` stripped)
+and ``<target>`` is present only when ``--genetic-correlation`` is set.
+Pass ``--out -`` to write to stdout instead, or ``--out <path>`` for a
+specific file.
 
 Usage:
     python3 out/rerun_heritability.py out/my_run \\
@@ -77,6 +83,26 @@ def _fmt(values: list[float]) -> str:
     return ", ".join(f"{v:.3f}" for v in values)
 
 
+def _basename_tag(path: str) -> str:
+    """Filesystem-safe tag derived from a genetics/phenotype path.
+
+    Strips directory, ``.hdf5`` suffix (so ``data/genetics/height_25.hdf5``
+    and the split-variants prefix ``data/genetics/height_25`` both yield
+    ``height_25``).
+    """
+    base = os.path.basename(path.rstrip("/"))
+    if base.endswith(".hdf5"):
+        base = base[: -len(".hdf5")]
+    return base
+
+
+def _default_out_path(outdir: str, genetics: str, target_phenotype: str | None) -> str:
+    parts = [_basename_tag(genetics)]
+    if target_phenotype is not None:
+        parts.append(_basename_tag(target_phenotype))
+    return os.path.join(outdir, "log." + ".".join(parts) + ".txt")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("outdir", type=str, help="training output directory (has latents/, train_ids.npy, val_ids.npy)")
@@ -94,7 +120,9 @@ def main() -> None:
                     help="HDF5 (keys 'data', 'ids') of a target phenotype; switches to per-latent "
                          "SCORE-OVERLAP genetic correlation with this phenotype")
     ap.add_argument("--which-cuda", type=int, default=0)
-    ap.add_argument("--out", type=str, default=None, help="output path (default: stdout)")
+    ap.add_argument("--out", type=str, default=None,
+                    help="output path (default: <outdir>/log.<genetics>[.<target>].txt; "
+                         "pass '-' for stdout)")
     args = ap.parse_args()
 
     device = torch.device(f"cuda:{args.which_cuda}" if torch.cuda.is_available() else "cpu")
@@ -182,7 +210,18 @@ def main() -> None:
     if not train_files:
         raise FileNotFoundError(f"No Zm_train.*.txt found in {latents_dir}")
 
-    out_fh = open(args.out, "w") if args.out else sys.stdout
+    if args.out is None:
+        out_path = _default_out_path(args.outdir, args.genetics, args.genetic_correlation)
+    else:
+        out_path = args.out
+
+    if out_path == "-":
+        out_fh = sys.stdout
+        close_at_end = False
+    else:
+        out_fh = open(out_path, "w")
+        close_at_end = True
+        print(f"writing rerun log to {out_path}", file=sys.stderr)
 
     try:
         for train_path in train_files:
@@ -224,7 +263,7 @@ def main() -> None:
             out_fh.write(line + "\n")
             out_fh.flush()
     finally:
-        if args.out:
+        if close_at_end:
             out_fh.close()
 
 
