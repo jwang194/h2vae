@@ -342,7 +342,11 @@ def gc(
     KV_y2 = K @ V_y2                                    # (n, 1)
     VKV_y2 = V_of(KV_y2)                                # (n, 1)
     d2_raw = (y2 * VKV_y2).sum() * nc - (y2 * V_y2).sum() * tr_Ktil
-    d2 = torch.clamp(torch.abs(d2_raw), min=1e-8) * torch.sign(d2_raw)
+    # MoM variance estimates can be negative when the true variance is small
+    # relative to noise; floor at 1e-8 (so sqrt(d1*d2) is real & non-NaN, and
+    # the clamp blocks the denominator's gradient in that regime).  Sign of
+    # the gc estimate is carried entirely by the numerator (genetic covariance).
+    d2 = torch.clamp(d2_raw, min=1e-8)
 
     def loss(y1: Tensor) -> Tensor:
         # y1 shape (n, 1) or (n, d) — treated uniformly.
@@ -351,7 +355,7 @@ def gc(
         KV_y1 = K @ V_y1
         VKV_y1 = V_of(KV_y1)
         d1_raw = (y1 * VKV_y1).sum(dim=0) * nc - (y1 * V_y1).sum(dim=0) * tr_Ktil
-        d1 = torch.clamp(torch.abs(d1_raw), min=1e-8) * torch.sign(d1_raw)
+        d1 = torch.clamp(d1_raw, min=1e-8)  # see comment on d2 above
         return num / torch.sqrt(d1 * d2)
 
     return loss
