@@ -570,14 +570,18 @@ def _compute_her_estimates(
 ) -> list[float]:
     """Compute per-dimension heritability estimates for display.
 
+    If ``her_fn`` exposes a ``.display`` attribute (as ``gc()`` does), the
+    display callable is used instead of the bare loss callable — for
+    genetic-correlation training the loss is the genetic covariance, but
+    we want to log the bounded ``ρ̂`` form.
+
     Args:
         Z: Latent matrix, shape (n, zdim).
-        her_fn: A callable that takes (n, 1) and returns a scalar estimate.
-            In MoM mode this is the batched ``mom()`` callable.
-            In Taylor mode this is the exact ``var_exp()`` callable.
+        her_fn: Loss callable; uses ``her_fn.display`` if present.
     """
+    fn = getattr(her_fn, "display", her_fn)
     Z = Z.detach()
-    return [her_fn(Z[:, i:i + 1]).item() for i in range(Z.shape[1])]
+    return [fn(Z[:, i:i + 1]).item() for i in range(Z.shape[1])]
 
 
 # ---------------------------------------------------------------------------
