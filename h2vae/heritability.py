@@ -298,8 +298,23 @@ def gc(
     estimator.
 
     The returned callable accepts ``y1`` of shape ``(n, 1)`` (single
-    phenotype) or ``(n, d)`` (batched), returning a vector of ``d``
-    per-column genetic correlations in a single matmul.
+    phenotype) or ``(n, d)`` (batched).  Both ``y1`` and ``y2`` are
+    standardised internally (matching the ``mom``/``var_exp`` convention),
+    so the callable is invariant under rescaling of the latents.
+
+    Two outputs are exposed:
+
+    * ``loss(y1) -> Tensor`` (the bare callable) returns the SCORE-OVERLAP
+      genetic-covariance numerator, which is ``γ̂ × det`` for the fixed
+      positive constant ``det = tr(K̃²)·(n-c) − tr(K̃)²``.  This is the
+      preferred *training* signal: it is finite for any input, has no
+      ``sqrt`` of a sign-ambiguous quantity, and (because the inputs are
+      standardised) is invariant to latent magnitude.
+
+    * ``loss.display(y1) -> Tensor`` returns the full ``ρ̂``, clamped to
+      ``[-1, 1]`` (Cauchy-Schwarz).  Use this for logging / human-readable
+      heritability values.  The clamp only binds in the degenerate-variance
+      regime where the unbounded MoM ratio has no statistical meaning.
 
     Args:
         X: Genetic data — genotype matrix (n, m) or kinship matrix (n, n).
@@ -311,7 +326,8 @@ def gc(
         device: Torch device for computation.
 
     Returns:
-        A callable ``loss(y1) -> Tensor``.
+        A callable ``loss(y1) -> Tensor`` with a ``.display`` attribute
+        for the correlation form.
     """
     n = X.shape[0]
     K = X if kinship else (X @ X.T) / X.shape[1]
@@ -331,33 +347,42 @@ def gc(
     V_of = lambda x: x - W @ (WtW_I @ (W.T @ x))
 
     # tr(V K V) without materialising V as (n, n):
-    #   tr(VKV) = tr(VKV) = tr(KV²) = tr(KV)
+    #   tr(VKV) = tr(KV²) = tr(KV)
     #          = tr(K) - tr(W(W'W)^{-1} W' K)
     #          = tr(K) - tr((W'W)^{-1} W'KW)    (cyclic)
     WtKW = W.T @ (K @ W)                                # (c, c)
     tr_Ktil = torch.trace(K) - torch.trace(WtW_I @ WtKW)
 
-    # y2-dependent quantities (precompute once)
+    # Standardise y2 once (mean-zero, unit variance) so the result is
+    # invariant to its scale, mirroring mom/var_exp.
+    y2 = (y2 - y2.mean(dim=0, keepdim=True)) / (y2.std(dim=0, keepdim=True) + 1e-8)
     V_y2 = V_of(y2)                                     # (n, 1)
     KV_y2 = K @ V_y2                                    # (n, 1)
     VKV_y2 = V_of(KV_y2)                                # (n, 1)
+    # Variance estimate for y2 (numerator of σ̂²_{g2}); needed for the
+    # display/correlation form only.  Floor matches the d1 floor below.
     d2_raw = (y2 * VKV_y2).sum() * nc - (y2 * V_y2).sum() * tr_Ktil
-    # MoM variance estimates can be negative when the true variance is small
-    # relative to noise; floor at 1e-8 (so sqrt(d1*d2) is real & non-NaN, and
-    # the clamp blocks the denominator's gradient in that regime).  Sign of
-    # the gc estimate is carried entirely by the numerator (genetic covariance).
     d2 = torch.clamp(d2_raw, min=1e-8)
 
-    def loss(y1: Tensor) -> Tensor:
-        # y1 shape (n, 1) or (n, d) — treated uniformly.
-        num = (y1 * VKV_y2).sum(dim=0) * nc - (y1 * V_y2).sum(dim=0) * tr_Ktil
-        V_y1 = V_of(y1)
-        KV_y1 = K @ V_y1
-        VKV_y1 = V_of(KV_y1)
-        d1_raw = (y1 * VKV_y1).sum(dim=0) * nc - (y1 * V_y1).sum(dim=0) * tr_Ktil
-        d1 = torch.clamp(d1_raw, min=1e-8)  # see comment on d2 above
-        return num / torch.sqrt(d1 * d2)
+    def _standardize(y: Tensor) -> Tensor:
+        return (y - y.mean(dim=0, keepdim=True)) / (y.std(dim=0, keepdim=True) + 1e-8)
 
+    def loss(y1: Tensor) -> Tensor:
+        """Genetic-covariance numerator (proportional to γ̂); training signal."""
+        y1s = _standardize(y1)
+        return (y1s * VKV_y2).sum(dim=0) * nc - (y1s * V_y2).sum(dim=0) * tr_Ktil
+
+    def display(y1: Tensor) -> Tensor:
+        """Full SCORE-OVERLAP ρ̂, clamped to [-1, 1] for stability."""
+        y1s = _standardize(y1)
+        num = (y1s * VKV_y2).sum(dim=0) * nc - (y1s * V_y2).sum(dim=0) * tr_Ktil
+        V_y1 = V_of(y1s)
+        VKV_y1 = V_of(K @ V_y1)
+        d1_raw = (y1s * VKV_y1).sum(dim=0) * nc - (y1s * V_y1).sum(dim=0) * tr_Ktil
+        d1 = torch.clamp(d1_raw, min=1e-8)
+        return torch.clamp(num / torch.sqrt(d1 * d2), min=-1.0, max=1.0)
+
+    loss.display = display
     return loss
 
 

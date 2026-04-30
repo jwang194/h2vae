@@ -74,9 +74,14 @@ def _load_covariate_subset(
 
 
 def _compute_h2(Z: torch.Tensor, her_fn) -> list[float]:
-    """Per-dimension heritability display — mirrors train_hvae._compute_her_estimates."""
+    """Per-dimension heritability display — mirrors train_hvae._compute_her_estimates.
+
+    Routes through ``her_fn.display`` when present (gc mode) so the logged
+    values are bounded correlations rather than the raw covariance loss.
+    """
+    fn = getattr(her_fn, "display", her_fn)
     Z = Z.detach()
-    return [her_fn(Z[:, i:i + 1]).item() for i in range(Z.shape[1])]
+    return [fn(Z[:, i:i + 1]).item() for i in range(Z.shape[1])]
 
 
 def _fmt(values: list[float]) -> str:
