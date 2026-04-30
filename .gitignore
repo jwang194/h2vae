@@ -32,3 +32,4 @@ eval/
 plots/
 # Local experimentation
 scratch/
+SPEEDUPS.md
