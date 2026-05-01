@@ -607,7 +607,7 @@ def encode_all(
 
     with torch.no_grad():
         for data in loader:
-            y = data[0].to(device)
+            y = data[0].to(device, non_blocking=True)
             idxs = data[-1]
             # SPEEDUPS #6: bf16 autocast on encode only; cast back to fp32 so
             # downstream consumers (heritability, KL, latent dump) stay fp32.
@@ -656,7 +656,7 @@ def train_epoch(
 
     for data in train_loader:
         Z = Z.detach()
-        y = data[0].to(device)
+        y = data[0].to(device, non_blocking=True)
         idxs = data[-1]
         eps = Eps[idxs]
 
@@ -728,7 +728,7 @@ def validate_epoch(
     mse_val = 0.0
     with torch.no_grad():
         for data in val_loader:
-            y = data[0].to(device)
+            y = data[0].to(device, non_blocking=True)
             idxs = data[-1]
             # SPEEDUPS #6: bf16 autocast on encode + decode only.
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
