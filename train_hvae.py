@@ -774,6 +774,12 @@ def main() -> None:
     torch.manual_seed(cfg.seed)
     device = cfg.device
 
+    # SPEEDUPS #4: NIfTI volumes pad to a fixed cubic target_size, so input
+    # shapes are stable; cuDNN benchmark picks the best Conv3d algorithm once
+    # and reuses it. (Global TF32 is intentionally NOT enabled here — it would
+    # silently downgrade heritability matmuls below the fp32 floor.)
+    torch.backends.cudnn.benchmark = True
+
     if cfg.debug:
         breakpoint()
 
