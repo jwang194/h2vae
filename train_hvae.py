@@ -630,8 +630,11 @@ def train_epoch(
 ) -> dict:
     """Run one training epoch (encode-then-backprop).
 
-    Returns dict with keys: mse, loss, her_estimates, and optionally
-    her_estimates_odd when split-variants is active.
+    Returns dict with keys: mse, loss, Zm_start. The display heritability
+    estimates and the per-epoch ``Zm_train`` savetxt are deferred to
+    ``main()``: the *next* epoch's start-of-epoch encode (which sees
+    post-update weights) is reused as this epoch's display state, dropping
+    one full encode_all pass per epoch.
     """
     device = cfg.device
     weights = cfg.loss_weights
@@ -684,25 +687,9 @@ def train_epoch(
         epoch_mse += mse.sum().item()
         epoch_loss += loss.item()
 
-    # Re-encode with current weights; use posterior means (not samples) for
-    # stable h² display — avoids reparameterization noise when zs is large.
-    Zm_post, _ = encode_all(vae, train_loader, cfg.zdim, device)
-
-    np.savetxt(
-        os.path.join(cfg.outdir, "latents", f"Zm_train.{epoch:05d}.txt"),
-        Zm_post.detach().cpu().numpy(),
-        delimiter="\t",
-    )
-
-    # Display estimates (even / primary)
-    result: dict = {"mse": epoch_mse, "loss": epoch_loss}
-    result["her_estimates"] = _compute_her_estimates(Zm_post, h_state.loss_fn)
-
-    # Display estimates (odd, if split-variants)
-    if cfg.split_variants:
-        result["her_estimates_odd"] = _compute_her_estimates(Zm_post, h_state.loss_fn_odd)
-
-    return result
+    # Zm here is the start-of-epoch encode (post-(prev epoch) weights). main()
+    # uses the next epoch's Zm to display + savetxt this epoch's results.
+    return {"mse": epoch_mse, "loss": epoch_loss, "Zm_start": Zm}
 
 
 def validate_epoch(
@@ -895,36 +882,74 @@ def main() -> None:
     optimizer = optim.Adam(vae.parameters(), lr=cfg.vae_lr)
 
     # --- Training loop ---
-    for epoch in range(start_epoch, cfg.epochs):
-        train_metrics = train_epoch(vae, train_loader, optimizer, h_state, cfg, epoch)
-        val_metrics = validate_epoch(vae, val_loader, h_state, cfg, epoch)
-
+    # Per-epoch train her_estimates + Zm_train savetxt are computed using the
+    # *next* epoch's start-of-epoch encode (SPEEDUPS #2): that encode sees the
+    # post-update weights for free, removing one full encode_all per epoch.
+    # We therefore buffer one epoch's mse/loss/val metrics and flush them on
+    # the next iteration once Zm_start is available.
+    def _flush_pending(pending: dict | None, Zm_for_train: Tensor) -> None:
+        if pending is None:
+            return
+        prev_epoch = pending["epoch"]
+        np.savetxt(
+            os.path.join(ldir, f"Zm_train.{prev_epoch:05d}.txt"),
+            Zm_for_train.detach().cpu().numpy(),
+            delimiter="\t",
+        )
+        her_train = _compute_her_estimates(Zm_for_train, h_state.loss_fn)
+        her_train_odd = (
+            _compute_her_estimates(Zm_for_train, h_state.loss_fn_odd)
+            if cfg.split_variants else None
+        )
+        val = pending["val_metrics"]
         if cfg.split_variants:
             logging.info(
                 "epoch %d - mse_train: %.4f - mse_val: %.4f"
                 " - h_train_even: %s - h_train_odd: %s"
                 " - h_val_even: %s - h_val_odd: %s",
-                epoch,
-                train_metrics["mse"],
-                val_metrics["mse_val"],
-                ", ".join(f"{h:.3f}" for h in train_metrics["her_estimates"]),
-                ", ".join(f"{h:.3f}" for h in train_metrics["her_estimates_odd"]),
-                ", ".join(f"{h:.3f}" for h in val_metrics["her_estimates_val"]),
-                ", ".join(f"{h:.3f}" for h in val_metrics["her_estimates_val_odd"]),
+                prev_epoch,
+                pending["mse"],
+                val["mse_val"],
+                ", ".join(f"{h:.3f}" for h in her_train),
+                ", ".join(f"{h:.3f}" for h in her_train_odd),
+                ", ".join(f"{h:.3f}" for h in val["her_estimates_val"]),
+                ", ".join(f"{h:.3f}" for h in val["her_estimates_val_odd"]),
             )
         else:
             logging.info(
                 "epoch %d - mse_train: %.4f - mse_val: %.4f - h_train: %s - h_val: %s",
-                epoch,
-                train_metrics["mse"],
-                val_metrics["mse_val"],
-                ", ".join(f"{h:.3f}" for h in train_metrics["her_estimates"]),
-                ", ".join(f"{h:.3f}" for h in val_metrics["her_estimates_val"]),
+                prev_epoch,
+                pending["mse"],
+                val["mse_val"],
+                ", ".join(f"{h:.3f}" for h in her_train),
+                ", ".join(f"{h:.3f}" for h in val["her_estimates_val"]),
             )
+
+    pending: dict | None = None
+    for epoch in range(start_epoch, cfg.epochs):
+        train_metrics = train_epoch(vae, train_loader, optimizer, h_state, cfg, epoch)
+        Zm_start = train_metrics.pop("Zm_start")
+
+        # Use this epoch's start-of-epoch Zm to flush previous epoch's display.
+        _flush_pending(pending, Zm_start)
+
+        val_metrics = validate_epoch(vae, val_loader, h_state, cfg, epoch)
+
+        pending = {
+            "epoch": epoch,
+            "mse": train_metrics["mse"],
+            "loss": train_metrics["loss"],
+            "val_metrics": val_metrics,
+        }
 
         if epoch % cfg.epoch_cb == 0:
             logging.info("epoch %d - saving checkpoint", epoch)
             torch.save(vae.state_dict(), os.path.join(wdir, f"weights.{epoch:05d}.pt"))
+
+    # Trailing flush: one final encode_all to finalize the last epoch's display.
+    if pending is not None:
+        Zm_final, _ = encode_all(vae, train_loader, cfg.zdim, device)
+        _flush_pending(pending, Zm_final)
 
 
 if __name__ == "__main__":
