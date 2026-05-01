@@ -609,9 +609,12 @@ def encode_all(
         for data in loader:
             y = data[0].to(device)
             idxs = data[-1]
-            zm, zs = vae.encode(y)
-            Zm[idxs] = zm
-            Zs[idxs] = zs
+            # SPEEDUPS #6: bf16 autocast on encode only; cast back to fp32 so
+            # downstream consumers (heritability, KL, latent dump) stay fp32.
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                zm, zs = vae.encode(y)
+            Zm[idxs] = zm.float()
+            Zs[idxs] = zs.float()
 
     return Zm, Zs
 
@@ -661,9 +664,16 @@ def train_epoch(
         if h_state.cov_state.decode_train is not None:
             c_batch = h_state.cov_state.decode_train[idxs]
 
-        zm, zs = vae.encode(y)
+        # SPEEDUPS #6: bf16 autocast on encode + decode only. zm/zs/xr are
+        # cast back to fp32 immediately so the heritability path, KL term
+        # (sensitive to log(zs)), and MSE stay in fp32.
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            zm, zs = vae.encode(y)
+        zm, zs = zm.float(), zs.float()
         z = zm + zs * eps
-        xr = vae.decode(z, c_batch)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            xr = vae.decode(z, c_batch)
+        xr = xr.float()
         mse = vae.mse(y, xr)
         kld = (
             -0.5 * (1 + 2 * torch.log(zs) - zm ** 2 - zs ** 2).sum(1)[:, None]
@@ -720,13 +730,18 @@ def validate_epoch(
         for data in val_loader:
             y = data[0].to(device)
             idxs = data[-1]
-            zm, _ = vae.encode(y)
+            # SPEEDUPS #6: bf16 autocast on encode + decode only.
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                zm, _ = vae.encode(y)
+            zm = zm.float()
             Zm[idxs] = zm
 
             c_batch = None
             if h_state.cov_state.decode_val is not None:
                 c_batch = h_state.cov_state.decode_val[idxs]
-            xr = vae.decode(zm, c_batch)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                xr = vae.decode(zm, c_batch)
+            xr = xr.float()
             mse_val += vae.mse(y, xr).sum().item()
 
     np.savetxt(
