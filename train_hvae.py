@@ -701,12 +701,33 @@ def validate_epoch(
 ) -> dict:
     """Run validation: encode, compute MSE and heritability.
 
+    Single pass over ``val_loader``: encode, decode (using zm directly,
+    matching the previous "z = Zm[idxs]" identification), and accumulate
+    MSE — eliminates the second val_loader iteration that re-decompressed
+    every NIfTI volume (SPEEDUPS #5).
+
     Returns dict with keys: mse_val, her_estimates_val, and optionally
     her_estimates_val_odd when split-variants is active.
     """
     device = cfg.device
 
-    Zm, Zs = encode_all(vae, val_loader, cfg.zdim, device)
+    vae.eval()
+    n = len(val_loader.dataset)
+    Zm = torch.zeros(n, cfg.zdim, device=device)
+
+    mse_val = 0.0
+    with torch.no_grad():
+        for data in val_loader:
+            y = data[0].to(device)
+            idxs = data[-1]
+            zm, _ = vae.encode(y)
+            Zm[idxs] = zm
+
+            c_batch = None
+            if h_state.cov_state.decode_val is not None:
+                c_batch = h_state.cov_state.decode_val[idxs]
+            xr = vae.decode(zm, c_batch)
+            mse_val += vae.mse(y, xr).sum().item()
 
     np.savetxt(
         os.path.join(cfg.outdir, "latents", f"Zm_val.{epoch:05d}.txt"),
@@ -715,26 +736,13 @@ def validate_epoch(
     )
 
     # Display estimates on posterior means for stability
-    result: dict = {}
+    result: dict = {"mse_val": mse_val}
     result["her_estimates_val"] = _compute_her_estimates(Zm, h_state.val_fn)
 
     # Display estimates (odd, if split-variants)
     if cfg.split_variants:
         result["her_estimates_val_odd"] = _compute_her_estimates(Zm, h_state.val_fn_odd)
 
-    mse_val = 0.0
-    with torch.no_grad():
-        for data in val_loader:
-            y = data[0].to(device)
-            idxs = data[-1]
-            z = Zm[idxs]
-            c_batch = None
-            if h_state.cov_state.decode_val is not None:
-                c_batch = h_state.cov_state.decode_val[idxs]
-            mse = vae.mse(y, vae.decode(z, c_batch))
-            mse_val += mse.sum().item()
-
-    result["mse_val"] = mse_val
     return result
 
 
