@@ -645,7 +645,14 @@ def train_epoch(
     # Phase 1: encode full dataset
     Zm, Zs = encode_all(vae, train_loader, cfg.zdim, device)
     Eps = torch.randn_like(Zs)
-    Z = Zm + Eps * Zs
+
+    # Heritability/corr/moment losses run on the posterior MEAN buffer (Zm),
+    # not on a sample (Z = Zm + Eps*Zs). Routing the gradient through zm only
+    # means dense_zs receives no gradient from these terms, eliminating the
+    # zs->0 collapse pathway that drove softplus underflow under bf16.
+    # The display path (`_compute_her_estimates`) was already on Zm, so this
+    # also aligns the optimization target with the displayed metric.
+    Zm_buf = Zm.clone()
 
     her_loss_fn = h_state.loss_fn
 
@@ -655,7 +662,7 @@ def train_epoch(
     epoch_loss = 0.0
 
     for data in train_loader:
-        Z = Z.detach()
+        Zm_buf = Zm_buf.detach()
         y = data[0].to(device, non_blocking=True)
         idxs = data[-1]
         eps = Eps[idxs]
@@ -681,10 +688,10 @@ def train_epoch(
         )
         vae_loss = mse + vae.beta * kld
 
-        Z[idxs] = z
+        Zm_buf[idxs] = zm
 
         loss, metrics = composite_loss(
-            vae_loss, zs, Z, her_loss_fn, h_state.hweights, vae.K, weights,
+            vae_loss, zs, Zm_buf, her_loss_fn, h_state.hweights, vae.K, weights,
             idxs=idxs,
         )
 
