@@ -74,6 +74,7 @@ python3 eval_latents.py --outdir out/my_run --epoch 100
 |------|------|---------------|------|---------------|
 | Method of moments | `--kinship` | Kinship matrix (n, n) | Haseman-Elston h² | h² |
 | Variance explained | (default) | Genotype matrix (n, m) | Taylor-expanded R² | Exact OLS R² |
+| Genetic correlation | `--genetic-correlation <file>` | Kinship or genotype matrix + target phenotype HDF5 | Per-latent SCORE-overlap genetic covariance with target | Genetic correlation |
 
 ### Covariate pathways
 
@@ -110,7 +111,7 @@ Select with `--model <name>`:
 Each epoch has two phases:
 
 1. **Encode all** — Run the full dataset through the encoder in eval mode to collect latent statistics (means and stds).
-2. **Mini-batch backprop** — For each batch, re-encode, sample from the posterior, update the full latent matrix Z, and backprop through a composite loss that combines reconstruction, heritability, and optional regularization terms (correlation, moment matching).
+2. **Mini-batch backprop** — For each batch, re-encode, sample from the posterior, update the full latent matrix Z, and backprop through a composite loss that combines reconstruction (MSE + KL), heritability, and optional regularization terms (latent correlation penalty, skew/kurtosis penalty).
 
 ## Output structure
 
@@ -140,12 +141,18 @@ Run `python3 train_hvae.py --help` for the full list of flags. Key options:
 | `--beta` | 1.0 | KL divergence weight |
 | `--kinship` | off | Use kinship matrix instead of genotypes |
 | `--split-variants` | off | Split even/odd chromosome validation |
+| `--genetic-correlation` | None | HDF5 of target phenotype; switches loss to per-latent genetic correlation |
 | `--train-frac` | 0.8 | Train/val split ratio |
 | `--hweights` | None | Per-latent heritability weight file |
+| `--mse-weight` | 1.0 | Reconstruction loss weight |
+| `--corr-weight` | 0.0 | Latent correlation penalty weight |
+| `--sk-weight` | 0.0 | Skew/kurtosis penalty weight |
 | `--decode-covariates` | None | Covariate names for decode conditioning |
 | `--residualize-covariates` | None | Covariate names for heritability residualization |
 | `--resume` | None | Output directory to resume from |
 | `--gradient-checkpoint` | off | Trade compute for memory |
+| `--filts` | (model default) | Number of conv filters |
 | `--vae-lr` | 1e-4 | Learning rate |
 | `--bs` | 64 | Batch size |
 | `--epochs` | 1001 | Total epochs |
+| `--epoch-cb` | — | Checkpoint interval |
