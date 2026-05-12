@@ -304,12 +304,14 @@ def gc(
 
     Two outputs are exposed:
 
-    * ``loss(y1) -> Tensor`` (the bare callable) returns the SCORE-OVERLAP
-      genetic-covariance numerator, which is ``γ̂ × det`` for the fixed
-      positive constant ``det = tr(K̃²)·(n-c) − tr(K̃)²``.  This is the
-      preferred *training* signal: it is finite for any input, has no
-      ``sqrt`` of a sign-ambiguous quantity, and (because the inputs are
-      standardised) is invariant to latent magnitude.
+    * ``loss(y1) -> Tensor`` (the bare callable) returns the genetic-
+      covariance estimate ``γ̂`` itself: the SCORE-OVERLAP numerator divided
+      by the fixed positive constant ``det = tr(K̃²)·(n-c) − tr(K̃)²``.  This
+      is the *training* signal — finite for any input, no ``sqrt`` of a
+      sign-ambiguous quantity, invariant to latent magnitude (since the
+      inputs are standardised), and **O(1) in magnitude per dim** so that
+      h_weight on the same scale as MoM (~0.01–0.1) gives a comparable
+      regularisation strength.
 
     * ``loss.display(y1) -> Tensor`` returns the full ``ρ̂``, clamped to
       ``[-1, 1]`` (Cauchy-Schwarz).  Use this for logging / human-readable
@@ -353,6 +355,19 @@ def gc(
     WtKW = W.T @ (K @ W)                                # (c, c)
     tr_Ktil = torch.trace(K) - torch.trace(WtW_I @ WtKW)
 
+    # tr(K̃²) = tr((VK)²) (uses V² = V, then cyclic).  Materialises one (n, n)
+    # intermediate during setup and frees it; this lets us divide the training
+    # signal below by the fixed positive constant `gc_det`, so the bare loss is
+    # O(1) (proportional to γ̂) rather than O(n²).  Without this normalisation,
+    # h_weight is profoundly unintuitive: gc raw loss is ~10⁸ at n≈13k, so
+    # h_weight=1e-5 silently delivers effective loss ~10³ — orders of magnitude
+    # larger than MoM-style h losses at h_weight=0.05.
+    WtK = W.T @ K                                       # (c, n)
+    VK_tmp = K - W @ (WtW_I @ WtK)                      # (n, n) — V applied from left
+    tr_Ktil2 = (VK_tmp * VK_tmp.T).sum()
+    del VK_tmp
+    gc_det = tr_Ktil2 * nc - tr_Ktil * tr_Ktil          # fixed, positive
+
     # Standardise y2 once (mean-zero, unit variance) so the result is
     # invariant to its scale, mirroring mom/var_exp.
     y2 = (y2 - y2.mean(dim=0, keepdim=True)) / (y2.std(dim=0, keepdim=True) + 1e-8)
@@ -368,9 +383,10 @@ def gc(
         return (y - y.mean(dim=0, keepdim=True)) / (y.std(dim=0, keepdim=True) + 1e-8)
 
     def loss(y1: Tensor) -> Tensor:
-        """Genetic-covariance numerator (proportional to γ̂); training signal."""
+        """Genetic-covariance estimate γ̂ (training signal, O(1) per dim)."""
         y1s = _standardize(y1)
-        return (y1s * VKV_y2).sum(dim=0) * nc - (y1s * V_y2).sum(dim=0) * tr_Ktil
+        num = (y1s * VKV_y2).sum(dim=0) * nc - (y1s * V_y2).sum(dim=0) * tr_Ktil
+        return num / gc_det
 
     def display(y1: Tensor) -> Tensor:
         """Full SCORE-OVERLAP ρ̂, clamped to [-1, 1] for stability."""
