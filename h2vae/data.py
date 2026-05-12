@@ -430,15 +430,24 @@ def load_data(
         train_image_paths = [id_to_path[i] for i in train_common]
         val_image_paths = [id_to_path[i] for i in val_common]
     else:
-        # (n, h, w, c) -> (n, c, h, w) float32
         img_idx_train = _reindex(image_ids, train_common)
         img_idx_val = _reindex(image_ids, val_common)
-        train_images = torch.tensor(
-            images_raw[img_idx_train].astype(np.float32).transpose((0, 3, 1, 2))
-        )
-        val_images = torch.tensor(
-            images_raw[img_idx_val].astype(np.float32).transpose((0, 3, 1, 2))
-        )
+        if images_raw.ndim == 4:
+            # (n, h, w, c) -> (n, c, h, w) float32
+            arr_train = images_raw[img_idx_train].astype(np.float32).transpose((0, 3, 1, 2))
+            arr_val = images_raw[img_idx_val].astype(np.float32).transpose((0, 3, 1, 2))
+        elif images_raw.ndim == 3:
+            # (n, c, L) — 1D, channels already leading
+            arr_train = images_raw[img_idx_train].astype(np.float32)
+            arr_val = images_raw[img_idx_val].astype(np.float32)
+        elif images_raw.ndim == 2:
+            # (n, L) -> (n, 1, L)
+            arr_train = images_raw[img_idx_train].astype(np.float32)[:, None, :]
+            arr_val = images_raw[img_idx_val].astype(np.float32)[:, None, :]
+        else:
+            raise ValueError(f"Unsupported images_raw.ndim={images_raw.ndim}")
+        train_images = torch.tensor(arr_train)
+        val_images = torch.tensor(arr_val)
 
     # --- Reindex covariates ---
     train_covariates = None
