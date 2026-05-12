@@ -33,3 +33,9 @@ plots/
 # Local experimentation
 scratch/
 SPEEDUPS.md
+notes/
+# Local Claude Code settings
+.claude/
+# Ad-hoc training transcripts / profile output
+T2.log
+*.profile.log
