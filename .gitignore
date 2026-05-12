@@ -39,3 +39,6 @@ notes/
 # Ad-hoc training transcripts / profile output
 T2.log
 *.profile.log
+# Python bytecode (should never have been tracked)
+__pycache__/
+*.pyc
