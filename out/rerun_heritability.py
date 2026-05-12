@@ -132,13 +132,61 @@ def main() -> None:
 
     device = torch.device(f"cuda:{args.which_cuda}" if torch.cuda.is_available() else "cpu")
 
-    # --- Split IDs ---
-    train_ids = np.load(os.path.join(args.outdir, "train_ids.npy"))
-    val_ids = np.load(os.path.join(args.outdir, "val_ids.npy"))
+    # --- Split IDs (as written by the original training run) ---
+    train_ids_orig = np.load(os.path.join(args.outdir, "train_ids.npy"))
+    val_ids_orig = np.load(os.path.join(args.outdir, "val_ids.npy"))
+
+    # --- Target phenotype + NaN filter (matches load_data convention) ---
+    # When --genetic-correlation is set, drop any sample whose target value is
+    # NaN, mirroring h2vae.data.load_data: silently dropping NaN targets is the
+    # only sensible behaviour (gc() would otherwise propagate NaN through
+    # tr(K̃²), tr(K̃) and the d2 floor → all reported h values become NaN).
+    use_gc = args.genetic_correlation is not None
+    train_keep = np.ones(len(train_ids_orig), dtype=bool)
+    val_keep = np.ones(len(val_ids_orig), dtype=bool)
+    y2_train = y2_val = None
+    if use_gc:
+        with h5py.File(args.genetic_correlation, "r") as f:
+            tp_ids = np.array(f["ids"])
+            tp_raw = np.array(f["data"])
+        if tp_raw.ndim == 1:
+            tp_raw = tp_raw[:, None]
+        id_to_tp_row = {v: i for i, v in enumerate(tp_ids)}
+        try:
+            tr_rows = np.array([id_to_tp_row[i] for i in train_ids_orig])
+            va_rows = np.array([id_to_tp_row[i] for i in val_ids_orig])
+        except KeyError as e:
+            raise ValueError(
+                f"target phenotype HDF5 missing id {e.args[0]} from the run's split"
+            )
+        train_y2_raw = tp_raw[tr_rows]
+        val_y2_raw = tp_raw[va_rows]
+        train_keep = ~np.isnan(train_y2_raw).any(axis=1)
+        val_keep = ~np.isnan(val_y2_raw).any(axis=1)
+        n_drop_tr = int((~train_keep).sum()); n_drop_va = int((~val_keep).sum())
+        if n_drop_tr or n_drop_va:
+            print(
+                f"# dropped {n_drop_tr} train + {n_drop_va} val samples with NaN "
+                f"target phenotype (kept {int(train_keep.sum())}/{len(train_ids_orig)} "
+                f"train, {int(val_keep.sum())}/{len(val_ids_orig)} val)",
+                file=sys.stderr,
+            )
+
+    train_ids = train_ids_orig[train_keep]
+    val_ids = val_ids_orig[val_keep]
     all_ids = np.concatenate([train_ids, val_ids])
     n_train = len(train_ids)
 
-    # --- Genetics ---
+    # Build y2 tensors on the filtered cohort (after the keep masks above).
+    if use_gc:
+        y2_train = torch.tensor(
+            train_y2_raw[train_keep].astype(np.float32), device=device,
+        )
+        y2_val = torch.tensor(
+            val_y2_raw[val_keep].astype(np.float32), device=device,
+        )
+
+    # --- Genetics (reindexed to the post-filter id order) ---
     if args.split_variants:
         even_path = f"{args.genetics}.even.hdf5"
         odd_path = f"{args.genetics}.odd.hdf5"
@@ -148,7 +196,7 @@ def main() -> None:
         g_main = load_genetics_reindexed(args.genetics, all_ids)
         g_odd = None
 
-    # --- Covariates (for residualization) ---
+    # --- Covariates (for residualization, post-filter) ---
     C_train = C_val = None
     if args.residualize_covariates is not None:
         if args.covariates is None:
@@ -157,20 +205,6 @@ def main() -> None:
         C_all = _load_covariate_subset(args.covariates, all_ids, selected, device)
         C_train = C_all[:n_train]
         C_val = C_all[n_train:]
-
-    # --- Target phenotype (for genetic-correlation mode) ---
-    use_gc = args.genetic_correlation is not None
-    y2_train = y2_val = None
-    if use_gc:
-        with h5py.File(args.genetic_correlation, "r") as f:
-            tp_ids = np.array(f["ids"])
-            tp_raw = np.array(f["data"])
-        if tp_raw.ndim == 1:
-            tp_raw = tp_raw[:, None]
-        row_idx = _reindex(tp_ids, all_ids)
-        y2_all = torch.tensor(tp_raw[row_idx].astype(np.float32), device=device)
-        y2_train = y2_all[:n_train]
-        y2_val = y2_all[n_train:]
 
     # --- Build heritability callables (mirrors train_hvae.setup_heritability) ---
     def _make_pair(genetics_dict):
@@ -239,11 +273,20 @@ def main() -> None:
                 print(f"# skipping epoch {epoch}: no {val_path}", file=sys.stderr)
                 continue
 
+            Zm_train_full = np.loadtxt(train_path, delimiter="\t")
+            Zm_val_full = np.loadtxt(val_path, delimiter="\t")
+            # Apply the same per-split filter that K, C, y2 were filtered with;
+            # the saved Z rows are in original train_ids/val_ids order.
+            if Zm_train_full.shape[0] != train_keep.shape[0]:
+                raise ValueError(
+                    f"{train_path} has {Zm_train_full.shape[0]} rows but split has "
+                    f"{train_keep.shape[0]}; cannot align"
+                )
             Zm_train = torch.tensor(
-                np.loadtxt(train_path, delimiter="\t"), dtype=torch.float32, device=device,
+                Zm_train_full[train_keep], dtype=torch.float32, device=device,
             )
             Zm_val = torch.tensor(
-                np.loadtxt(val_path, delimiter="\t"), dtype=torch.float32, device=device,
+                Zm_val_full[val_keep], dtype=torch.float32, device=device,
             )
 
             h_train = _compute_h2(Zm_train, tr_fn)
