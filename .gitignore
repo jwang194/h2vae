@@ -42,3 +42,4 @@ T2.log
 # Python bytecode (should never have been tracked)
 __pycache__/
 *.pyc
+SCORE/
