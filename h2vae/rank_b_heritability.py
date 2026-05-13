@@ -30,13 +30,26 @@ Two modes:
 """
 from __future__ import annotations
 
+import logging
+import os
+import time
+
 import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from h2vae.cohort_cache import CohortCache
+from h2vae.cohort_cache import CohortCache, have_fast_kernel
 from h2vae.plink import BedFile
+
+# Enable verbose timing of the setup phase by setting H2VAE_RANKB_DEBUG=1.
+_DEBUG = os.environ.get("H2VAE_RANKB_DEBUG", "0") == "1"
+
+
+def _t(label: str, t0: float) -> float:
+    if _DEBUG:
+        logging.info(f"[rank-B] {label}: {time.time() - t0:.2f}s")
+    return time.time()
 
 
 class RankBHeritability(nn.Module):
@@ -86,8 +99,15 @@ class RankBHeritability(nn.Module):
         self.mode = "gc" if y_target is not None else "mom"
 
         # --- The ONE BED pass: build cache + variant stats together ---
+        t0 = time.time()
+        if _DEBUG:
+            logging.info(
+                f"[rank-B] init: n={self.n}  m={self.m}  chunk={self.chunk}  "
+                f"mode={self.mode}  fast_kernel={have_fast_kernel()}"
+            )
         self.cache = CohortCache(self.n, self.m, chunk_variants=self.chunk)
         mean, sd, n_obs = self._build_cache_and_compute_variant_stats()
+        t0 = _t("cache build + variant stats", t0)
         # All subsequent setup work reads from `self.cache`, not `self.bed`.
         self.register_buffer("var_mean", torch.from_numpy(mean).to(self.device, dtype))
         self.register_buffer("var_sd",   torch.from_numpy(sd).to(self.device, dtype))
@@ -131,6 +151,7 @@ class RankBHeritability(nn.Module):
             WtW = self._W.T @ self._W
             self.register_buffer("_WtW_inv", torch.linalg.inv(WtW))
             XtW = self._compute_XtW(self._W)
+            t0 = _t("compute X^T W (cache walk)", t0)
             self.register_buffer("_XtW", XtW)
             self.register_buffer("_M", XtW @ self._WtW_inv)
             tr_K_W = float((self._M * XtW).sum() / self.m)
@@ -142,6 +163,7 @@ class RankBHeritability(nn.Module):
         # --- tr((PKP)²) via Hutchinson (cache walks) --------------------
         self.b_hutch = int(b_hutch)
         self.register_buffer("tr_pkp2", self._hutchinson_trace_K2(seed_hutch))
+        t0 = _t("Hutchinson tr(K^2) (2 cache walks)", t0)
 
         # --- gc-mode precomputation (cache walks) ----------------------
         if self.mode == "gc":
@@ -157,6 +179,7 @@ class RankBHeritability(nn.Module):
             y2 = (y2 - mu_y2) / sd_y2
             self.register_buffer("y_target", y2)
             self._precompute_gc()
+            t0 = _t("gc precomputation (2 cache walks)", t0)
 
         # --- Empty per-step state buffers (sized on first rebuild) -----
         self.register_buffer("u_raw", torch.empty(0, dtype=dtype, device=self.device))
@@ -185,48 +208,85 @@ class RankBHeritability(nn.Module):
     # ==================================================================
 
     def _build_cache_and_compute_variant_stats(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Single BED pass.  Populates ``self.cache`` and returns
-        ``(mean, sd, n_obs)`` for every variant.
+        """Build the cohort cache and return ``(mean, sd, n_obs)``.
 
-        Variance is computed by the two-pass identity
-        ``var = Σ(X − μ)² / n`` on an fp32 deviation working copy
-        (option 5 in the perf notes) — half the memory footprint of the
-        original fp64 path, and slightly more numerically stable than
-        the one-pass ``E[X²] − (E[X])²`` formula.
+        Fast path (when the C kernel is available): one BED pass into a
+        variant-major int8 buffer, then a tiled C transpose into the
+        final sample-major bit-packed cache.  Matches SCORE's per-fit
+        BED traffic (one disk pass) while preserving sample-major
+        access for the per-minibatch rank-B updates.
+
+        Slow path (numpy fallback): chunk-by-chunk decode + build, with
+        the option-5 fp32 variance pass per chunk.
         """
+        if have_fast_kernel():
+            sum_x, sum_x2, n_obs = self.cache.build_via_variant_major(
+                self.bed, self.row_idx, chunk_variants=self.chunk,
+            )
+            ct_safe = np.maximum(n_obs, 1).astype(np.float64)
+            mean = sum_x / ct_safe
+            var = sum_x2 / ct_safe - mean * mean
+            sd = np.sqrt(np.maximum(var, 0.0))
+            sd[sd < 1e-8] = 1e-8
+            return mean, sd, n_obs.astype(np.float64)
+
+        # Fallback: numpy-only path.
         mean = np.empty(self.m, dtype=np.float64)
         var = np.empty(self.m, dtype=np.float64)
         n_obs = np.empty(self.m, dtype=np.int64)
         for j_lo, j_hi in self._chunks():
             X_int8 = self.bed.decode_variants(j_lo, j_hi, row_idx=self.row_idx)
-            # --- Cache build for this chunk ---
             self.cache.build_chunk(j_lo, j_hi, X_int8)
-            # --- Variant stats (option 5: int + fp32 working tensors) ---
-            mask = X_int8 != -1
-            n_observed = mask.sum(axis=0, dtype=np.int64)
-            ct_safe = np.maximum(n_observed, 1).astype(np.float64)
-            X_int = X_int8.copy()
-            np.putmask(X_int, ~mask, 0)
-            sum_x = X_int.sum(axis=0, dtype=np.int64)
-            mu = sum_x / ct_safe
-            dev = X_int.astype(np.float32) - mu.astype(np.float32)
-            np.putmask(dev, ~mask, 0.0)
-            sq = np.einsum("ij,ij->j", dev, dev, dtype=np.float64)
-            v = sq / ct_safe
-            mean[j_lo:j_hi] = mu
-            var[j_lo:j_hi] = v
-            n_obs[j_lo:j_hi] = n_observed
+            self._slow_stats_chunk(X_int8, j_lo, mean, var, n_obs)
         self.cache.finalise()
         sd = np.sqrt(var)
         sd[sd < 1e-8] = 1e-8
         return mean, sd, n_obs.astype(np.float64)
+
+    @staticmethod
+    def _slow_stats_chunk(X_int8: np.ndarray, j_lo: int,
+                           mean: np.ndarray, var: np.ndarray,
+                           n_obs: np.ndarray) -> None:
+        """Per-chunk numpy stats (option 5 path).  Only used as a
+        fallback or for partial trailing chunks.
+        """
+        n_var_chunk = X_int8.shape[1]
+        mask = X_int8 != -1
+        n_observed = mask.sum(axis=0, dtype=np.int64)
+        ct_safe = np.maximum(n_observed, 1).astype(np.float64)
+        X_int = X_int8.copy()
+        np.putmask(X_int, ~mask, 0)
+        sum_x = X_int.sum(axis=0, dtype=np.int64)
+        mu = sum_x / ct_safe
+        dev = X_int.astype(np.float32) - mu.astype(np.float32)
+        np.putmask(dev, ~mask, 0.0)
+        sq = np.einsum("ij,ij->j", dev, dev, dtype=np.float64)
+        v = sq / ct_safe
+        mean[j_lo:j_lo + n_var_chunk] = mu
+        var[j_lo:j_lo + n_var_chunk] = v
+        n_obs[j_lo:j_lo + n_var_chunk] = n_observed
 
     # ==================================================================
     # Cache-backed standardised decoders (no BED I/O)
     # ==================================================================
 
     def _decode_chunk_std(self, j_lo: int, j_hi: int) -> Tensor:
-        """Standardised fp32 ``(n_cohort, j_hi - j_lo)`` chunk from cache."""
+        """Standardised fp32 ``(n_cohort, j_hi - j_lo)`` chunk from cache.
+
+        On CUDA + fp32, the bit-packed chunk slice is shipped to GPU and
+        unpacked + standardised by a single CUDA kernel
+        (``_decode_cuda.decode_and_standardise``). This shrinks the per-
+        chunk PCIe traffic from ~2 GB fp32 to ~130 MB packed bytes and
+        eliminates the CPU bit-unpack on the host side.
+
+        On CPU (or fp64 test runs), the existing decode + standardise
+        path is used.
+        """
+        if self.device.type == "cuda" and self.dtype == torch.float32:
+            return self._decode_chunk_std_cuda(j_lo, j_hi)
+        return self._decode_chunk_std_cpu(j_lo, j_hi)
+
+    def _decode_chunk_std_cpu(self, j_lo: int, j_hi: int) -> Tensor:
         X_int8 = self.cache.decode_variant_chunk(j_lo, j_hi)
         X = torch.from_numpy(X_int8.astype(np.float32)).to(self.device)
         mu = self.var_mean[j_lo:j_hi]
@@ -236,11 +296,33 @@ class RankBHeritability(nn.Module):
             X = torch.where(missing, mu.expand_as(X), X)
         return (X - mu) / sd
 
+    def _decode_chunk_std_cuda(self, j_lo: int, j_hi: int) -> Tensor:
+        # Lazy import: load_inline compiles on first use, requires nvcc
+        # + gcc-12+ + ninja, which we don't want to demand on CPU runs.
+        from h2vae._decode_cuda import decode_and_standardise
+        byte_lo = j_lo // 4
+        byte_hi = (j_hi + 3) // 4
+        chunk_var = j_hi - j_lo
+        packed_np = np.ascontiguousarray(self.cache._cache[:, byte_lo:byte_hi])
+        packed = torch.from_numpy(packed_np).to(self.device, non_blocking=True)
+        return decode_and_standardise(
+            packed,
+            self.var_mean[j_lo:j_hi].contiguous(),
+            self.var_sd[j_lo:j_hi].contiguous(),
+            chunk_var=chunk_var,
+        )
+
     def _decode_rows_std(self, cohort_idx: np.ndarray) -> Tensor:
         """Standardised fp32 ``(B, m)`` row gather from cache.
 
-        ``cohort_idx`` indexes into the cohort (not the BED).
+        ``cohort_idx`` indexes into the cohort (not the BED).  Same
+        CUDA/CPU branching as ``_decode_chunk_std``.
         """
+        if self.device.type == "cuda" and self.dtype == torch.float32:
+            return self._decode_rows_std_cuda(cohort_idx)
+        return self._decode_rows_std_cpu(cohort_idx)
+
+    def _decode_rows_std_cpu(self, cohort_idx: np.ndarray) -> Tensor:
         X_int8 = self.cache.decode_rows(cohort_idx)
         X = torch.from_numpy(X_int8.astype(np.float32)).to(self.device)
         mu = self.var_mean
@@ -249,6 +331,15 @@ class RankBHeritability(nn.Module):
         if missing.any():
             X = torch.where(missing, mu.expand_as(X), X)
         return (X - mu) / sd
+
+    def _decode_rows_std_cuda(self, cohort_idx: np.ndarray) -> Tensor:
+        from h2vae._decode_cuda import decode_and_standardise
+        # Fancy-index gather of packed rows on the host (small copy).
+        packed_np = np.ascontiguousarray(self.cache._cache[cohort_idx, :])
+        packed = torch.from_numpy(packed_np).to(self.device, non_blocking=True)
+        return decode_and_standardise(
+            packed, self.var_mean, self.var_sd, chunk_var=self.m,
+        )
 
     # ==================================================================
     # Setup-time accumulators (all reading from the cache)
@@ -322,6 +413,7 @@ class RankBHeritability(nn.Module):
 
     @torch.no_grad()
     def rebuild(self, Z: Tensor) -> None:
+        t0 = time.time()
         if Z.shape[0] != self.n:
             raise ValueError(f"Z has {Z.shape[0]} rows; cohort has {self.n}")
         Z = Z.detach().to(self.device, self.dtype)
@@ -334,6 +426,8 @@ class RankBHeritability(nn.Module):
         if self.has_W:
             self.w_raw = self._W.T @ Z
         self.Z_prev = Z.clone()
+        if _DEBUG:
+            logging.info(f"[rank-B] rebuild (cache walk): {time.time() - t0:.2f}s")
 
     # ==================================================================
     # Per-minibatch update + loss

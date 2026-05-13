@@ -43,3 +43,4 @@ T2.log
 __pycache__/
 *.pyc
 SCORE/
+*.so

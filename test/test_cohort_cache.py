@@ -127,6 +127,61 @@ def test_chunk_must_be_4_aligned() -> None:
         raise AssertionError("expected ValueError")
 
 
+def test_fast_kernel_matches_slow_path() -> None:
+    """C-kernel build path agrees with the numpy build path bit-for-bit."""
+    from h2vae.cohort_cache import have_fast_kernel
+    if not have_fast_kernel():
+        print(f"  fast-kernel test skipped (no _bed_pack.so)")
+        return
+
+    G, bed = _make_fixture(n=64, m=40, seed=99, missing_rate=0.15)
+    row_idx = np.array([3, 11, 17, 22, 29, 37, 50, 58, 63, 0])
+
+    # --- Slow path ---
+    slow = CohortCache(n=len(row_idx), m=bed.m, chunk_variants=16)
+    chunk = 16
+    j = 0
+    while j < bed.m:
+        j_hi = min(j + chunk, bed.m)
+        X_int8 = bed.decode_variants(j, j_hi, row_idx=row_idx)
+        slow.build_chunk(j, j_hi, X_int8)
+        j = j_hi
+    slow.finalise()
+
+    # --- Fast path ---
+    fast = CohortCache(n=len(row_idx), m=bed.m, chunk_variants=16)
+    bytes_per_var_BED = bed.bytes_per_variant
+    j = 0
+    while j < bed.m:
+        j_hi = min(j + chunk, bed.m)
+        n_var = j_hi - j
+        # mmap slice of the BED.
+        bed_block = bed._mm[j:j_hi]               # (n_var, bytes_per_var_BED)
+        sum_x = np.zeros(n_var, dtype=np.int64)
+        sum_x2 = np.zeros(n_var, dtype=np.int64)
+        n_obs = np.zeros(n_var, dtype=np.int64)
+        if j_hi == bed.m and (j_hi - j) % 4 != 0:
+            # For the partial last chunk, pad to a multiple of 4 with
+            # missing variants — but the slow path also handles partial
+            # natively. Here we just skip this test for the unaligned tail.
+            break
+        fast.build_chunk_from_bed(bed_block, row_idx, j, sum_x, sum_x2, n_obs)
+        j = j_hi
+    fast.finalise()
+
+    # Decode both caches and compare.
+    # If we stopped early due to partial-tail, decode up to the aligned point.
+    j_final = j
+    Y_slow = slow.decode_variant_chunk(0, j_final)
+    Y_fast = fast.decode_variant_chunk(0, j_final)
+    assert np.array_equal(Y_slow, Y_fast), (
+        f"fast/slow mismatch at first diff: "
+        f"{np.argmax((Y_slow != Y_fast).any(axis=0))}"
+    )
+    print(f"  fast C kernel ≡ slow numpy path  "
+          f"(j_final={j_final}, n_cohort={len(row_idx)})")
+
+
 if __name__ == "__main__":
     print("CohortCache tests:")
     test_full_variant_chunk_round_trip()
@@ -137,4 +192,5 @@ if __name__ == "__main__":
     test_decode_rows_variant_range()
     test_build_before_finalise_blocks_read()
     test_chunk_must_be_4_aligned()
+    test_fast_kernel_matches_slow_path()
     print("all tests passed.")
