@@ -308,20 +308,37 @@ def load_data(
         id_to_path = None
 
     # --- Read genetics ---
+    # Three accepted forms for ``genetics_path``:
+    #   1. an HDF5 file containing ``kinship`` (and ``kinship_ids``);
+    #   2. an HDF5 file containing ``genotypes`` (and ``genotype_ids``);
+    #   3. a PLINK prefix — ``{path}.bed/.bim/.fam`` all present. In
+    #      this case we only use the .fam for cohort IDs here; the BED
+    #      is opened lazily by the rank-B heritability path in
+    #      ``setup_heritability``.
+    from h2vae.plink import is_plink_prefix, read_fam_ids
     has_kinship = False
     has_genotypes = False
-    with h5py.File(genetics_path, "r") as f:
-        if "kinship" in f:
-            has_kinship = True
-            kin_ids = np.array(f["kinship_ids"])
-            kinship_raw = np.array(f["kinship"])
-        if "genotypes" in f:
-            has_genotypes = True
-            gen_ids = np.array(f["genotype_ids"])
-            genotypes_raw = np.array(f["genotypes"])
+    has_plink = False
+    plink_prefix: str | None = None
+    if is_plink_prefix(genetics_path):
+        has_plink = True
+        plink_prefix = genetics_path
+        gen_ids = read_fam_ids(genetics_path)
+    else:
+        with h5py.File(genetics_path, "r") as f:
+            if "kinship" in f:
+                has_kinship = True
+                kin_ids = np.array(f["kinship_ids"])
+                kinship_raw = np.array(f["kinship"])
+            if "genotypes" in f:
+                has_genotypes = True
+                gen_ids = np.array(f["genotype_ids"])
+                genotypes_raw = np.array(f["genotypes"])
 
-    if not has_kinship and not has_genotypes:
-        raise ValueError(f"No kinship or genotypes found in {genetics_path}")
+    if not (has_kinship or has_genotypes or has_plink):
+        raise ValueError(
+            f"No kinship, genotypes, or PLINK files found at {genetics_path}"
+        )
 
     # --- Read covariates (optional) ---
     has_covariates = covariates_path is not None
@@ -349,7 +366,7 @@ def load_data(
     all_id_arrays = [image_ids]
     if has_kinship:
         all_id_arrays.append(kin_ids)
-    if has_genotypes:
+    if has_genotypes or has_plink:
         all_id_arrays.append(gen_ids)
     if has_covariates:
         all_id_arrays.append(cov_ids)
@@ -468,7 +485,13 @@ def load_data(
         val_target = torch.tensor(tp_raw[tp_idx_val].astype(np.float32))
 
     # --- Reindex genetics (full [train; val] order) ---
-    genetics: dict[str, Tensor | None] = {"kinship": None, "genotypes": None}
+    # ``plink_row_idx`` indexes into the BED file's full sample list and
+    # is consumed by the rank-B heritability path (which mmaps the BED
+    # and decodes on demand).
+    genetics: dict[str, Tensor | str | np.ndarray | None] = {
+        "kinship": None, "genotypes": None,
+        "plink_prefix": plink_prefix, "plink_row_idx": None,
+    }
     if has_kinship:
         kin_idx = _reindex(kin_ids, all_common)
         genetics["kinship"] = torch.tensor(
@@ -479,6 +502,8 @@ def load_data(
         genetics["genotypes"] = torch.tensor(
             genotypes_raw[gen_idx].astype(np.float32)
         )
+    if has_plink:
+        genetics["plink_row_idx"] = _reindex(gen_ids, all_common)
 
     return {
         "train": {
@@ -507,22 +532,35 @@ def load_data(
 def load_genetics_reindexed(
     path: str,
     id_order: np.ndarray,
-) -> dict[str, Tensor | None]:
-    """Load a genetics HDF5 file and reindex to match a given ID order.
+) -> dict[str, Tensor | str | np.ndarray | None]:
+    """Load a genetics source and reindex to match a given ID order.
 
-    Used to load a second genetics file (e.g. odd-chromosome variants)
-    after ``load_data()`` has established the sample order via inner join.
+    Accepts an HDF5 file (kinship and/or genotypes) **or** a PLINK
+    prefix (``<path>.bed`` etc. exist).  Used to load a second genetics
+    source — e.g. odd-chromosome variants — after ``load_data()`` has
+    established the sample order via inner join.
 
     Args:
-        path: Path to genetics HDF5 file.
+        path: HDF5 file path or PLINK prefix.
         id_order: Array of sample IDs in the desired order (train first,
             then val). Must be a subset of the IDs in the file.
 
     Returns:
-        Dict with keys ``"kinship"`` and ``"genotypes"``, each either a
-        Tensor or None depending on what the file contains.
+        Dict with keys ``"kinship"``, ``"genotypes"``, ``"plink_prefix"``,
+        ``"plink_row_idx"`` — each populated only as appropriate to the
+        source format.
     """
-    genetics: dict[str, Tensor | None] = {"kinship": None, "genotypes": None}
+    from h2vae.plink import is_plink_prefix, read_fam_ids
+    genetics: dict[str, Tensor | str | np.ndarray | None] = {
+        "kinship": None, "genotypes": None,
+        "plink_prefix": None, "plink_row_idx": None,
+    }
+    if is_plink_prefix(path):
+        gen_ids = read_fam_ids(path)
+        genetics["plink_prefix"] = path
+        genetics["plink_row_idx"] = _reindex(gen_ids, id_order)
+        return genetics
+
     with h5py.File(path, "r") as f:
         if "kinship" in f:
             kin_ids = np.array(f["kinship_ids"])

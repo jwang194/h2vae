@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 from h2vae.models import get_model_class
 from h2vae.models.base import BaseVAE
 from h2vae.heritability import mom, var_exp, gc
+from h2vae.rank_b_heritability import RankBHeritability
 from h2vae.data import (
     ImageDataset, ImageFileDataset, load_data, load_genetics_reindexed,
     make_streaming_dataset,
@@ -89,6 +90,7 @@ class HVAEConfig:
     # Heritability
     hweights: str | None = None  # text file: one weight per line, one per latent dim
     kinship: bool = False
+    r2: bool = False  # --genetics is a genotype HDF5; use OLS R² (var_exp)
     split_variants: bool = False
     genetic_correlation: str | None = None  # HDF5 with target phenotype (switches loss to gc)
 
@@ -170,8 +172,9 @@ def parse_args() -> HVAEConfig:
 
     # Heritability
     parser.add_argument("--hweights", type=str, default=None, help="text file with per-latent heritability weights (one per line)")
-    parser.add_argument("--kinship", action="store_true", default=False, help="use kinship matrix instead of genotypes")
-    parser.add_argument("--split-variants", action="store_true", default=False, help="--genetics is a prefix; load {prefix}.even.hdf5 and {prefix}.odd.hdf5")
+    parser.add_argument("--kinship", action="store_true", default=False, help="--genetics is a precomputed-kinship HDF5; use direct mom/gc")
+    parser.add_argument("--r2", action="store_true", default=False, help="--genetics is a genotype HDF5; use OLS R² (var_exp). Mutually exclusive with --kinship and --genetic-correlation")
+    parser.add_argument("--split-variants", action="store_true", default=False, help="--genetics is a prefix; load {prefix}.even.* and {prefix}.odd.* (HDF5 or PLINK)")
     parser.add_argument("--genetic-correlation", type=str, default=None,
                         help="HDF5 (keys 'data', 'ids') of a target phenotype; switches the loss "
                              "to per-latent SCORE-OVERLAP genetic correlation with this phenotype")
@@ -212,6 +215,7 @@ def parse_args() -> HVAEConfig:
         sk_weight=args.sk_weight,
         hweights=args.hweights,
         kinship=args.kinship,
+        r2=args.r2,
         split_variants=args.split_variants,
         genetic_correlation=args.genetic_correlation,
         decode_covariates=args.decode_covariates,
@@ -310,11 +314,16 @@ class CovariateState:
 
 @dataclass
 class HeritabilityState:
-    """Holds heritability loss functions and related state.
+    """Holds heritability loss callables / rank-B modules and related state.
 
-    Kinship mode (``--kinship``): ``loss_fn`` / ``val_fn`` are batched MoM callables.
-    Genotype mode (default):       ``loss_fn`` / ``val_fn`` are batched ``var_exp`` callables.
-    In both modes, the same callable is used for both backprop loss and display.
+    Three execution paths share this struct:
+
+    * ``--kinship``  → ``loss_fn`` / ``val_fn`` are kinship-mode mom/gc.
+    * ``--r2``       → ``loss_fn`` / ``val_fn`` are genotype-mode
+      ``var_exp()`` (or ``gc()`` if combined with --genetic-correlation,
+      though that combo is currently rejected at parse time).
+    * neither flag (PLINK)  → ``rank_b`` / ``rank_b_val`` are the
+      rank-B modules, and the callable slots stay ``None``.
     """
     # Backprop loss (even-chromosome when split, single otherwise)
     loss_fn: Callable | None = None
@@ -324,6 +333,12 @@ class HeritabilityState:
     loss_fn_odd: Callable | None = None
     val_fn_odd: Callable | None = None
 
+    # Rank-B modules (PLINK path)
+    rank_b: RankBHeritability | None = None
+    rank_b_val: RankBHeritability | None = None
+    rank_b_odd: RankBHeritability | None = None
+    rank_b_val_odd: RankBHeritability | None = None
+
     cov_state: CovariateState = None  # type: ignore[assignment]
     hweights: Tensor | None = None
 
@@ -332,17 +347,22 @@ def setup_heritability(
     cfg: HVAEConfig,
     data: dict,
 ) -> HeritabilityState:
-    """Set up heritability loss functions and covariate state.
+    """Set up heritability loss functions / rank-B modules.
 
-    Three modes, chosen by flags:
-      * ``--kinship`` + no ``--genetic-correlation``: batched ``mom()`` (h² via MoM).
-      * no ``--kinship`` + no ``--genetic-correlation``: batched ``var_exp()`` (OLS R²).
-      * ``--genetic-correlation <file>``: batched ``gc()`` — per-latent SCORE-OVERLAP
-        genetic correlation with the supplied target phenotype.  Composes with
-        ``--kinship`` (controls whether the genetics matrix is treated as a
-        kinship or a genotype matrix to form the GRM) and ``--split-variants``
-        (even chromosomes for backprop, odd for display).
+    Three orthogonal flags determine the path:
+
+    * ``--r2``    → genotype HDF5 + ``var_exp()``. Mutually exclusive
+      with ``--kinship`` and ``--genetic-correlation``.
+    * ``--kinship`` → kinship HDF5 + direct ``mom()`` (or ``gc()`` with
+      ``--genetic-correlation``).
+    * neither      → PLINK ``.bed/.bim/.fam`` + rank-B heritability,
+      with mode ``mom`` (default) or ``gc`` (with ``--genetic-correlation``).
     """
+    if cfg.r2 and cfg.kinship:
+        raise ValueError("--r2 and --kinship are mutually exclusive")
+    if cfg.r2 and cfg.genetic_correlation is not None:
+        raise ValueError("--r2 and --genetic-correlation are mutually exclusive")
+
     device = cfg.device
     cov_state = CovariateState()
     n_train = data["n_train"]
@@ -388,7 +408,70 @@ def setup_heritability(
         y2_train = y2_train.to(device)
         y2_val = y2_val.to(device)
 
-    # --- Build heritability estimators ---
+    # --- Per-latent heritability weights (used by all paths) ---
+    hweights_tensor = None
+    if cfg.hweights is not None:
+        hweights_tensor = read_weights(cfg.hweights).to(device)
+        h_state.hweights = hweights_tensor
+
+    # --- PLINK rank-B path (default when neither --r2 nor --kinship) ---
+    plink_prefix = data["genetics"].get("plink_prefix")
+    if not cfg.r2 and not cfg.kinship:
+        if plink_prefix is None:
+            raise ValueError(
+                "expected --genetics to point to PLINK .bed/.bim/.fam files; "
+                "use --kinship for a precomputed-kinship HDF5 or --r2 for a "
+                "genotype HDF5"
+            )
+        from h2vae.plink import BedFile
+        row_idx_full = data["genetics"]["plink_row_idx"]
+        row_idx_train = row_idx_full[:n_train]
+        row_idx_val = row_idx_full[n_train:]
+        bed = BedFile(plink_prefix)
+
+        h_state.rank_b = RankBHeritability(
+            bed, row_idx_train,
+            C=C_resid_train,
+            y_target=y2_train if use_gc else None,
+            hweights=hweights_tensor,
+            device=device,
+        )
+        h_state.rank_b_val = RankBHeritability(
+            bed, row_idx_val,
+            C=C_resid_val,
+            y_target=y2_val if use_gc else None,
+            hweights=hweights_tensor,
+            device=device,
+        )
+
+        if cfg.split_variants:
+            odd_genetics = data.get("genetics_odd", {})
+            odd_prefix = odd_genetics.get("plink_prefix") if odd_genetics else None
+            if odd_prefix is None:
+                raise ValueError(
+                    "--split-variants on PLINK requires "
+                    f"{cfg.genetics}.odd.bed/.bim/.fam to exist"
+                )
+            odd_row_idx_full = odd_genetics["plink_row_idx"]
+            bed_odd = BedFile(odd_prefix)
+            h_state.rank_b_odd = RankBHeritability(
+                bed_odd, odd_row_idx_full[:n_train],
+                C=C_resid_train,
+                y_target=y2_train if use_gc else None,
+                hweights=hweights_tensor,
+                device=device,
+            )
+            h_state.rank_b_val_odd = RankBHeritability(
+                bed_odd, odd_row_idx_full[n_train:],
+                C=C_resid_val,
+                y_target=y2_val if use_gc else None,
+                hweights=hweights_tensor,
+                device=device,
+            )
+        return h_state
+
+    # --- Build heritability estimators (kinship or --r2 genotype-HDF5 path) ---
+    assert cfg.r2 or cfg.kinship  # PLINK path returned above
     if cfg.kinship:
         # Fixed callables from kinship matrices.
         K = data["genetics"]["kinship"]
@@ -445,10 +528,6 @@ def setup_heritability(
             else:
                 h_state.loss_fn_odd = var_exp(G_odd_train, C_resid_train, device)
                 h_state.val_fn_odd = var_exp(G_odd_val, C_resid_val, device)
-
-    # --- Per-latent heritability weights ---
-    if cfg.hweights is not None:
-        h_state.hweights = read_weights(cfg.hweights).to(device)
 
     return h_state
 
@@ -518,17 +597,24 @@ def composite_loss(
     vae_loss: Tensor,
     zs: Tensor,
     Z: Tensor,
-    her_loss_fn: Callable | list[Callable],
+    her_loss_fn: Callable | list[Callable] | None,
     hweights: Tensor | None,
     K: int,
     weights: LossWeights,
     idxs: Tensor | None = None,
+    rank_b: RankBHeritability | None = None,
+    zm_batch: Tensor | None = None,
 ) -> tuple[Tensor, dict]:
     """Compute the weighted composite loss.
 
     Args:
         idxs: Batch indices, required when ``her_loss_fn`` is a list
-            (Taylor mode).
+            (Taylor mode) **or** when ``rank_b`` is provided.
+        rank_b: Optional rank-B heritability module. When set, the
+            heritability term comes from ``rank_b.update_and_loss``;
+            ``her_loss_fn`` is ignored.
+        zm_batch: Minibatch rows of ``Zm`` (live in the graph). Only
+            consumed when ``rank_b`` is given.
 
     Returns:
         loss: Scalar loss tensor.
@@ -538,7 +624,14 @@ def composite_loss(
     metrics: dict[str, float] = {"vae_loss": vae_loss.sum().item()}
 
     if weights.h > 0:
-        h_loss = compute_heritability_loss(Z, her_loss_fn, hweights, idxs=idxs)
+        if rank_b is not None:
+            if zm_batch is None or idxs is None:
+                raise ValueError(
+                    "rank_b requires both zm_batch and idxs"
+                )
+            h_loss = rank_b.update_and_loss(zm_batch, idxs)
+        else:
+            h_loss = compute_heritability_loss(Z, her_loss_fn, hweights, idxs=idxs)
         loss = loss + weights.h * h_loss
         metrics["her_loss"] = h_loss.item()
 
@@ -654,6 +747,14 @@ def train_epoch(
     # also aligns the optimization target with the displayed metric.
     Zm_buf = Zm.clone()
 
+    # Rank-B mode: refresh u_raw and w_raw with the full-cohort Zm
+    # (one BED stream). Subsequent minibatch loss calls update both
+    # rank-B-style and require no further BED stream.
+    if h_state.rank_b is not None:
+        h_state.rank_b.rebuild(Zm)
+        if h_state.rank_b_odd is not None:
+            h_state.rank_b_odd.rebuild(Zm)
+
     her_loss_fn = h_state.loss_fn
 
     # Phase 2: mini-batch backprop
@@ -692,7 +793,7 @@ def train_epoch(
 
         loss, metrics = composite_loss(
             vae_loss, zs, Zm_buf, her_loss_fn, h_state.hweights, vae.K, weights,
-            idxs=idxs,
+            idxs=idxs, rank_b=h_state.rank_b, zm_batch=zm,
         )
 
         optimizer.zero_grad()
@@ -759,11 +860,14 @@ def validate_epoch(
 
     # Display estimates on posterior means for stability
     result: dict = {"mse_val": mse_val}
-    result["her_estimates_val"] = _compute_her_estimates(Zm, h_state.val_fn)
-
-    # Display estimates (odd, if split-variants)
-    if cfg.split_variants:
-        result["her_estimates_val_odd"] = _compute_her_estimates(Zm, h_state.val_fn_odd)
+    if h_state.rank_b_val is not None:
+        result["her_estimates_val"] = h_state.rank_b_val.display(Zm).tolist()
+        if cfg.split_variants:
+            result["her_estimates_val_odd"] = h_state.rank_b_val_odd.display(Zm).tolist()
+    else:
+        result["her_estimates_val"] = _compute_her_estimates(Zm, h_state.val_fn)
+        if cfg.split_variants:
+            result["her_estimates_val_odd"] = _compute_her_estimates(Zm, h_state.val_fn_odd)
 
     return result
 
@@ -820,9 +924,16 @@ def main() -> None:
             logging.info("--resume specified but no checkpoints found in %s", cfg.resume)
 
     # --- Data ---
+    from h2vae.plink import is_plink_prefix
     genetics_path = cfg.genetics
     if cfg.split_variants:
-        genetics_path = f"{cfg.genetics}.even.hdf5"
+        # Prefer a PLINK prefix at `{cfg.genetics}.even`; fall back to
+        # `{cfg.genetics}.even.hdf5`.
+        even_plink = f"{cfg.genetics}.even"
+        if is_plink_prefix(even_plink):
+            genetics_path = even_plink
+        else:
+            genetics_path = f"{cfg.genetics}.even.hdf5"
 
     # Union of covariate names whose completeness gates sample inclusion.
     # Lets the covariates HDF5 carry NaNs for unmeasured fields; the cohort
@@ -846,7 +957,11 @@ def main() -> None:
     )
 
     if cfg.split_variants:
-        odd_path = f"{cfg.genetics}.odd.hdf5"
+        odd_plink = f"{cfg.genetics}.odd"
+        if is_plink_prefix(odd_plink):
+            odd_path = odd_plink
+        else:
+            odd_path = f"{cfg.genetics}.odd.hdf5"
         all_ids = np.concatenate([data["train_ids_raw"], data["val_ids_raw"]])
         data["genetics_odd"] = load_genetics_reindexed(odd_path, all_ids)
         logging.info("split-variants: loaded even from %s, odd from %s", genetics_path, odd_path)
@@ -932,11 +1047,18 @@ def main() -> None:
             Zm_for_train.detach().cpu().numpy(),
             delimiter="\t",
         )
-        her_train = _compute_her_estimates(Zm_for_train, h_state.loss_fn)
-        her_train_odd = (
-            _compute_her_estimates(Zm_for_train, h_state.loss_fn_odd)
-            if cfg.split_variants else None
-        )
+        if h_state.rank_b is not None:
+            her_train = h_state.rank_b.display(Zm_for_train).tolist()
+            her_train_odd = (
+                h_state.rank_b_odd.display(Zm_for_train).tolist()
+                if cfg.split_variants else None
+            )
+        else:
+            her_train = _compute_her_estimates(Zm_for_train, h_state.loss_fn)
+            her_train_odd = (
+                _compute_her_estimates(Zm_for_train, h_state.loss_fn_odd)
+                if cfg.split_variants else None
+            )
         val = pending["val_metrics"]
         if cfg.split_variants:
             logging.info(
