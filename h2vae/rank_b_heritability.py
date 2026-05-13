@@ -1,34 +1,32 @@
 """Rank-B updated method-of-moments heritability and genetic correlation.
 
 Maintains factored state ``u_raw = X^T Z`` and ``w_raw = W^T Z`` across
-minibatches.  At the start of each epoch ``rebuild(Z)`` streams the
-genome once to populate the state; within the epoch each minibatch
-applies a rank-B update using ``BedFile.decode_rows`` on B sample
-indices plus a small matmul for ``w_raw``.  The residualised projection
-of ``X^T Z`` against the covariate space ``W`` is then exact:
+minibatches.  At the start of each epoch ``rebuild(Z)`` recomputes
+``u_raw`` from scratch; within the epoch each minibatch applies a
+rank-B update using a sample-row gather on the cohort cache, plus a
+small matmul for ``w_raw``.  Residualised projection of ``X^T Z`` is
+exact via
 
-    (PX)^T Z = X^T P Z = X^T Z − X^T W (W^T W)^{-1} W^T Z
-            = u_raw − M w_raw
+    (PX)^T Z = X^T Z − X^T W (W^T W)^{-1} W^T Z = u_raw − M w_raw
 
-with ``M = X^T W (W^T W)^{-1}`` constant and precomputed at setup.
-``tr((PKP)²)`` is estimated once via Hutchinson with ``b_hutch``
-Gaussian probes (two BED passes); ``tr(PKP)`` is computed exactly from
-per-variant statistics.
+with ``M = X^T W (W^T W)^{-1}`` constant.  ``tr((PKP)²)`` is estimated
+once via Hutchinson with ``b_hutch`` Gaussian probes (in-memory cache
+walks); ``tr(PKP)`` is exact from per-variant statistics.
+
+**Performance architecture** (see ``notes/rank_b_heritability_perf.md``,
+combined options 5+6+8): on construction, the BED is streamed **once**
+to build a bit-packed sample-major cohort cache (``CohortCache``,
+``~19.5 GB`` per cohort at UKB scale) and accumulate variant stats in
+the same pass.  Every subsequent operation —
+``_compute_XtW``, ``_hutchinson_trace_K2``, ``_precompute_gc``,
+``rebuild``, ``update_and_loss`` — reads from the in-memory cache
+rather than the BED.  This matches SCORE's Round 1 per-fit BED traffic.
 
 Two modes:
 
 * **mom** (default): replicates ``h2vae.heritability.mom()`` exactly.
-  ``W = C`` (no intercept prepended, matching mom's convention);
-  ``W = None`` when ``C`` is ``None``, in which case no projection is
-  applied and the no-C formula is used.
-* **gc**: replicates ``h2vae.heritability.gc()``.  Requires a target
-  phenotype ``y_target``.  ``W = [1 | C]`` (intercept-augmented,
-  matching gc's convention); ``C`` may be ``None`` (W is then just the
-  intercept).  Precomputes ``V y_target``, ``VKV y_target`` and the
-  fixed scalars ``tr_Ktil``, ``tr_Ktil2``, ``gc_det``, ``d2``.
-
-Both modes share the rank-B update pathway through ``u_raw`` and
-``w_raw``; the per-dim loss / display formulas differ.
+* **gc**: replicates ``h2vae.heritability.gc()`` (loss = γ̂,
+  ``.display`` = ρ̂).
 """
 from __future__ import annotations
 
@@ -37,37 +35,28 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from h2vae.cohort_cache import CohortCache
 from h2vae.plink import BedFile
-
-
-def _stream_variant_chunks(bed: BedFile, row_idx: np.ndarray,
-                           chunk: int = 4096):
-    """Yield ``(j_lo, j_hi, X_int8)`` for variant chunks."""
-    m = bed.m
-    j = 0
-    while j < m:
-        j_hi = min(j + chunk, m)
-        yield j, j_hi, bed.decode_variants(j, j_hi, row_idx=row_idx)
-        j = j_hi
 
 
 class RankBHeritability(nn.Module):
     """Streaming-style MoM heritability / gc with rank-B minibatch updates.
 
     Args:
-        bed: PLINK ``BedFile`` (mmap'd; consumed lazily).
+        bed: PLINK ``BedFile``; consumed exactly once at construction.
         row_idx: ``(n,)`` int array of BED sample-row indices in the
             cohort; same row order as the ``Z`` passed to ``rebuild``.
         C: ``(n, c)`` covariate matrix to residualise against, or
-            ``None``.  Meaning is mode-specific:
-              * ``mom`` mode: ``W = C``; ``None`` ⇒ no projection.
-              * ``gc`` mode:  ``W = [1 | C]``; ``None`` ⇒ ``W = [1]``.
+            ``None``.  Mode-specific:
+              * mom mode: ``W = C``; ``None`` ⇒ no projection.
+              * gc mode:  ``W = [1 | C]``; ``None`` ⇒ ``W = [1]``.
         y_target: ``(n, 1)`` reference phenotype.  ``None`` selects mom
             mode; non-``None`` selects gc mode.
         hweights: optional ``(zdim,)`` per-latent-dim weighting for the
             scalar loss reduction.
         device: torch device for state tensors.
-        chunk_variants: BED stream chunk size in variants.
+        chunk_variants: variant chunk size used during build / walks.
+            Must be a multiple of 4 (CohortCache alignment).
         b_hutch: Hutchinson probe count for ``tr((PKP)²)``.
         seed_hutch: RNG seed for the Hutchinson probes.
         dtype: state dtype (default fp32).
@@ -96,8 +85,10 @@ class RankBHeritability(nn.Module):
         self.dtype = dtype
         self.mode = "gc" if y_target is not None else "mom"
 
-        # --- Variant standardisation + tr(K) (one BED stream) ----------
-        mean, sd, n_obs = self._compute_variant_stats()
+        # --- The ONE BED pass: build cache + variant stats together ---
+        self.cache = CohortCache(self.n, self.m, chunk_variants=self.chunk)
+        mean, sd, n_obs = self._build_cache_and_compute_variant_stats()
+        # All subsequent setup work reads from `self.cache`, not `self.bed`.
         self.register_buffer("var_mean", torch.from_numpy(mean).to(self.device, dtype))
         self.register_buffer("var_sd",   torch.from_numpy(sd).to(self.device, dtype))
         self.tr_K = float(n_obs.sum() / self.m)
@@ -135,26 +126,24 @@ class RankBHeritability(nn.Module):
             self.c = int(W.shape[1])
             self.nc = float(self.n - self.c)
 
-        # --- WtW_inv, X^T W, M, tr(PKP) --------------------------------
+        # --- WtW_inv, X^T W, M, tr(PKP) (cache walks) -------------------
         if self.has_W:
-            WtW = self._W.T @ self._W                          # (c, c)
+            WtW = self._W.T @ self._W
             self.register_buffer("_WtW_inv", torch.linalg.inv(WtW))
-            XtW = self._compute_XtW(self._W)                    # (m, c)
+            XtW = self._compute_XtW(self._W)
             self.register_buffer("_XtW", XtW)
-            self.register_buffer("_M", XtW @ self._WtW_inv)     # (m, c)
+            self.register_buffer("_M", XtW @ self._WtW_inv)
             tr_K_W = float((self._M * XtW).sum() / self.m)
             self.tr_pkp = self.tr_K - tr_K_W
-            # Precompute W^T 1 (constant) for the centering correction.
-            self.register_buffer("_W_col_sum",
-                                  self._W.sum(dim=0))           # (c,)
+            self.register_buffer("_W_col_sum", self._W.sum(dim=0))
         else:
             self.tr_pkp = self.tr_K
 
-        # --- tr((PKP)²) via Hutchinson ---------------------------------
+        # --- tr((PKP)²) via Hutchinson (cache walks) --------------------
         self.b_hutch = int(b_hutch)
         self.register_buffer("tr_pkp2", self._hutchinson_trace_K2(seed_hutch))
 
-        # --- gc-mode precomputation -----------------------------------
+        # --- gc-mode precomputation (cache walks) ----------------------
         if self.mode == "gc":
             y2 = y_target.to(self.device, dtype)
             if y2.ndim == 1:
@@ -163,14 +152,13 @@ class RankBHeritability(nn.Module):
                 raise ValueError(
                     f"y_target has {y2.shape[0]} rows; cohort has {self.n}"
                 )
-            # Match gc()'s _standardize: (y - mean) / std (unbiased).
             mu_y2 = y2.mean(dim=0, keepdim=True)
             sd_y2 = y2.std(dim=0, keepdim=True, unbiased=True).clamp_min(1e-8)
-            y2 = (y2 - mu_y2) / sd_y2                          # (n, 1)
+            y2 = (y2 - mu_y2) / sd_y2
             self.register_buffer("y_target", y2)
-            self._precompute_gc()                              # fills V_y2 etc.
+            self._precompute_gc()
 
-        # --- Empty state buffers (sized on first rebuild) -------------
+        # --- Empty per-step state buffers (sized on first rebuild) -----
         self.register_buffer("u_raw", torch.empty(0, dtype=dtype, device=self.device))
         if self.has_W:
             self.register_buffer("w_raw", torch.empty(0, dtype=dtype, device=self.device))
@@ -182,34 +170,64 @@ class RankBHeritability(nn.Module):
             self.hweights = None
 
     # ==================================================================
-    # Setup-time streaming primitives
+    # Chunk iteration over the cache
     # ==================================================================
 
-    def _compute_variant_stats(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _chunks(self):
+        """Yield ``(j_lo, j_hi)`` over the variant axis at the build chunk size."""
+        j = 0
+        while j < self.m:
+            yield j, min(j + self.chunk, self.m)
+            j += self.chunk
+
+    # ==================================================================
+    # ONE-PASS build: BED → cache + variant stats together
+    # ==================================================================
+
+    def _build_cache_and_compute_variant_stats(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Single BED pass.  Populates ``self.cache`` and returns
+        ``(mean, sd, n_obs)`` for every variant.
+
+        Variance is computed by the two-pass identity
+        ``var = Σ(X − μ)² / n`` on an fp32 deviation working copy
+        (option 5 in the perf notes) — half the memory footprint of the
+        original fp64 path, and slightly more numerically stable than
+        the one-pass ``E[X²] − (E[X])²`` formula.
+        """
         mean = np.empty(self.m, dtype=np.float64)
         var = np.empty(self.m, dtype=np.float64)
-        n_obs = np.empty(self.m, dtype=np.float64)
-        for j_lo, j_hi, X_int8 in _stream_variant_chunks(
-            self.bed, self.row_idx, self.chunk
-        ):
-            X = X_int8.astype(np.float64)
-            mask = X != -1
-            ct = mask.sum(axis=0)
-            ct_safe = np.where(ct == 0, 1, ct)
-            X_for_mean = np.where(mask, X, 0.0)
-            mu = X_for_mean.sum(axis=0) / ct_safe
-            sq = (np.where(mask, X - mu, 0.0) ** 2).sum(axis=0) / ct_safe
+        n_obs = np.empty(self.m, dtype=np.int64)
+        for j_lo, j_hi in self._chunks():
+            X_int8 = self.bed.decode_variants(j_lo, j_hi, row_idx=self.row_idx)
+            # --- Cache build for this chunk ---
+            self.cache.build_chunk(j_lo, j_hi, X_int8)
+            # --- Variant stats (option 5: int + fp32 working tensors) ---
+            mask = X_int8 != -1
+            n_observed = mask.sum(axis=0, dtype=np.int64)
+            ct_safe = np.maximum(n_observed, 1).astype(np.float64)
+            X_int = X_int8.copy()
+            np.putmask(X_int, ~mask, 0)
+            sum_x = X_int.sum(axis=0, dtype=np.int64)
+            mu = sum_x / ct_safe
+            dev = X_int.astype(np.float32) - mu.astype(np.float32)
+            np.putmask(dev, ~mask, 0.0)
+            sq = np.einsum("ij,ij->j", dev, dev, dtype=np.float64)
+            v = sq / ct_safe
             mean[j_lo:j_hi] = mu
-            var[j_lo:j_hi] = sq
-            n_obs[j_lo:j_hi] = ct
+            var[j_lo:j_hi] = v
+            n_obs[j_lo:j_hi] = n_observed
+        self.cache.finalise()
         sd = np.sqrt(var)
         sd[sd < 1e-8] = 1e-8
-        return mean.astype(np.float32), sd.astype(np.float32), n_obs
+        return mean, sd, n_obs.astype(np.float64)
 
-    def _decode_chunk_std(self, j_lo: int, j_hi: int,
-                          row_idx: np.ndarray | None = None) -> Tensor:
-        rows = self.row_idx if row_idx is None else row_idx
-        X_int8 = self.bed.decode_variants(j_lo, j_hi, row_idx=rows)
+    # ==================================================================
+    # Cache-backed standardised decoders (no BED I/O)
+    # ==================================================================
+
+    def _decode_chunk_std(self, j_lo: int, j_hi: int) -> Tensor:
+        """Standardised fp32 ``(n_cohort, j_hi - j_lo)`` chunk from cache."""
+        X_int8 = self.cache.decode_variant_chunk(j_lo, j_hi)
         X = torch.from_numpy(X_int8.astype(np.float32)).to(self.device)
         mu = self.var_mean[j_lo:j_hi]
         sd = self.var_sd[j_lo:j_hi]
@@ -218,8 +236,12 @@ class RankBHeritability(nn.Module):
             X = torch.where(missing, mu.expand_as(X), X)
         return (X - mu) / sd
 
-    def _decode_rows_std(self, rows: np.ndarray) -> Tensor:
-        X_int8 = self.bed.decode_rows(rows)
+    def _decode_rows_std(self, cohort_idx: np.ndarray) -> Tensor:
+        """Standardised fp32 ``(B, m)`` row gather from cache.
+
+        ``cohort_idx`` indexes into the cohort (not the BED).
+        """
+        X_int8 = self.cache.decode_rows(cohort_idx)
         X = torch.from_numpy(X_int8.astype(np.float32)).to(self.device)
         mu = self.var_mean
         sd = self.var_sd
@@ -228,11 +250,13 @@ class RankBHeritability(nn.Module):
             X = torch.where(missing, mu.expand_as(X), X)
         return (X - mu) / sd
 
+    # ==================================================================
+    # Setup-time accumulators (all reading from the cache)
+    # ==================================================================
+
     def _compute_XtW(self, W: Tensor) -> Tensor:
         XtW = torch.zeros((self.m, W.shape[1]), device=self.device, dtype=self.dtype)
-        for j_lo, j_hi, _ in _stream_variant_chunks(
-            self.bed, self.row_idx, self.chunk
-        ):
+        for j_lo, j_hi in self._chunks():
             Xc = self._decode_chunk_std(j_lo, j_hi)
             XtW[j_lo:j_hi] = Xc.T @ W
         return XtW
@@ -247,19 +271,13 @@ class RankBHeritability(nn.Module):
         else:
             PZ = Z
 
-        # Stream 1: v = X^T (P Z)
         v = torch.zeros((self.m, self.b_hutch), device=self.device, dtype=self.dtype)
-        for j_lo, j_hi, _ in _stream_variant_chunks(
-            self.bed, self.row_idx, self.chunk
-        ):
+        for j_lo, j_hi in self._chunks():
             Xc = self._decode_chunk_std(j_lo, j_hi)
             v[j_lo:j_hi] = Xc.T @ PZ
 
-        # Stream 2: y = X v
         y = torch.zeros((self.n, self.b_hutch), device=self.device, dtype=self.dtype)
-        for j_lo, j_hi, _ in _stream_variant_chunks(
-            self.bed, self.row_idx, self.chunk
-        ):
+        for j_lo, j_hi in self._chunks():
             Xc = self._decode_chunk_std(j_lo, j_hi)
             y += Xc @ v[j_lo:j_hi]
 
@@ -273,39 +291,27 @@ class RankBHeritability(nn.Module):
 
     @torch.no_grad()
     def _precompute_gc(self) -> None:
-        """gc-mode precomputation: V y2, KV y2, VKV y2, gc_det, d2."""
-        y2 = self.y_target                                     # (n, 1)
-        # V y2 (already standardised internally).
+        y2 = self.y_target
         V_y2 = y2 - self._W @ (self._WtW_inv @ (self._W.T @ y2))
         self.register_buffer("_V_y2", V_y2)
 
-        # K V_y2  via streaming: X^T V_y2 (m-vec), then X (X^T V_y2) (n-vec).
         XtV_y2 = torch.zeros((self.m, 1), device=self.device, dtype=self.dtype)
-        for j_lo, j_hi, _ in _stream_variant_chunks(
-            self.bed, self.row_idx, self.chunk
-        ):
+        for j_lo, j_hi in self._chunks():
             Xc = self._decode_chunk_std(j_lo, j_hi)
             XtV_y2[j_lo:j_hi] = Xc.T @ V_y2
-        # X (X^T V_y2)
         KV_y2 = torch.zeros((self.n, 1), device=self.device, dtype=self.dtype)
-        for j_lo, j_hi, _ in _stream_variant_chunks(
-            self.bed, self.row_idx, self.chunk
-        ):
+        for j_lo, j_hi in self._chunks():
             Xc = self._decode_chunk_std(j_lo, j_hi)
             KV_y2 += Xc @ XtV_y2[j_lo:j_hi]
         KV_y2 = KV_y2 / self.m
         self.register_buffer("_KV_y2", KV_y2)
 
-        # VKV y2 = V (KV y2)
         VKV_y2 = KV_y2 - self._W @ (self._WtW_inv @ (self._W.T @ KV_y2))
         self.register_buffer("_VKV_y2", VKV_y2)
 
-        # gc_det = tr_Ktil2 · nc − tr_Ktil²
-        tr_pkp2_scalar = self.tr_pkp2
-        gc_det = tr_pkp2_scalar * self.nc - self.tr_pkp ** 2
+        gc_det = self.tr_pkp2 * self.nc - self.tr_pkp ** 2
         self.register_buffer("_gc_det", gc_det.detach())
 
-        # d2 = (y2 · VKV y2) · nc − (y2 · V y2) · tr_Ktil, floored.
         d2_raw = ((y2 * VKV_y2).sum() * self.nc
                   - (y2 * V_y2).sum() * self.tr_pkp)
         self.register_buffer("_d2", torch.clamp(d2_raw, min=1e-8))
@@ -321,9 +327,7 @@ class RankBHeritability(nn.Module):
         Z = Z.detach().to(self.device, self.dtype)
         zdim = Z.shape[1]
         u_raw = torch.zeros((self.m, zdim), device=self.device, dtype=self.dtype)
-        for j_lo, j_hi, _ in _stream_variant_chunks(
-            self.bed, self.row_idx, self.chunk
-        ):
+        for j_lo, j_hi in self._chunks():
             Xc = self._decode_chunk_std(j_lo, j_hi)
             u_raw[j_lo:j_hi] = Xc.T @ Z
         self.u_raw = u_raw
@@ -345,19 +349,19 @@ class RankBHeritability(nn.Module):
             )
 
         cohort_idx_np = cohort_idx.detach().cpu().numpy().astype(np.int64)
-        bed_rows = self.row_idx[cohort_idx_np]
 
         u_prev = self.u_raw.detach()
         Z_prev_batch = self.Z_prev[cohort_idx]
         delta_Z = Z_batch - Z_prev_batch
 
-        X_batch = self._decode_rows_std(bed_rows)              # (B, m)
+        # Rank-B BED-row gather → straight from the cache, no disk.
+        X_batch = self._decode_rows_std(cohort_idx_np)
         delta_u = X_batch.T @ delta_Z
         u_new = u_prev + delta_u
 
         if self.has_W:
             w_prev = self.w_raw.detach()
-            W_batch = self._W[cohort_idx]                      # (B, c)
+            W_batch = self._W[cohort_idx]
             delta_w = W_batch.T @ delta_Z
             w_new = w_prev + delta_w
         else:
@@ -371,8 +375,6 @@ class RankBHeritability(nn.Module):
         with torch.no_grad():
             self.Z_prev[cohort_idx] = Z_batch.detach()
 
-        # Both mom and gc loss formulas already return per-dim values in
-        # the "higher = better" direction.  Negate to make this a loss.
         if self.hweights is None:
             return -per_dim.sum()
         return -(per_dim * self.hweights).sum()
@@ -383,8 +385,6 @@ class RankBHeritability(nn.Module):
 
     def _per_dim_signal(self, u: Tensor, w: Tensor | None,
                         Z_batch: Tensor, cohort_idx: Tensor) -> Tensor:
-        """Per-dim h² (mom) or γ̂ (gc), matching the upstream estimators."""
-        # Reconstruct live Z so that per-column mean / std are current.
         Z = self.Z_prev.clone()
         Z[cohort_idx] = Z_batch
 
@@ -397,27 +397,25 @@ class RankBHeritability(nn.Module):
 
     def _mom_h2(self, u: Tensor, w: Tensor | None,
                 Z: Tensor, mu: Tensor, sd: Tensor) -> Tensor:
-        u_std = u / sd                                          # (m, zdim); X^T 1 = 0
+        u_std = u / sd
 
         if not self.has_W:
-            q_pkp = (u_std * u_std).sum(dim=0) / self.m         # (zdim,)
+            q_pkp = (u_std * u_std).sum(dim=0) / self.m
             num = q_pkp - (self.n - 1)
-            denom = self.tr_pkp2 - self.n                       # = tr(K²) − n
+            denom = self.tr_pkp2 - self.n
             return num / denom
 
-        # With covariates.  Center Z first (W has no intercept under mom).
         Z_centered = Z - mu
         Zs = Z_centered / sd
 
-        CtZs = self._W.T @ Zs                                   # (c, zdim)
-        u_resid = u_std - self._M @ CtZs                        # (m, zdim)
+        CtZs = self._W.T @ Zs
+        u_resid = u_std - self._M @ CtZs
         q_pkp = (u_resid * u_resid).sum(dim=0) / self.m
 
-        zz = (Zs * Zs).sum(dim=0)                               # ≈ n-1
+        zz = (Zs * Zs).sum(dim=0)
         wwz = (CtZs * (self._WtW_inv @ CtZs)).sum(dim=0)
         q_p = zz - wwz
 
-        # 2x2 system per dim:  A V = B
         device = self.device
         dtype = self.dtype
         tr_pkp_t = torch.as_tensor(self.tr_pkp, device=device, dtype=dtype)
@@ -433,14 +431,7 @@ class RankBHeritability(nn.Module):
         return V[0] / (V_sum + 1e-8 * sign)
 
     def _gc_gamma(self, Z: Tensor, mu: Tensor, sd: Tensor) -> Tensor:
-        """gc-mode genetic covariance γ̂ per dim (matches gc()'s loss).
-
-        Uses the live ``Z`` (with the minibatch already patched in by
-        the caller, preserving the autograd graph through ``Z_batch``).
-        The dot products are O(n) per latent dim and avoid any per-step
-        BED stream.
-        """
-        Zs = (Z - mu) / sd                                      # (n, zdim)
+        Zs = (Z - mu) / sd
         num = ((Zs * self._VKV_y2).sum(dim=0) * self.nc
                - (Zs * self._V_y2).sum(dim=0) * self.tr_pkp)
         return num / self._gc_det
@@ -451,17 +442,12 @@ class RankBHeritability(nn.Module):
 
     @torch.no_grad()
     def display(self, Z: Tensor) -> Tensor:
-        """Per-dim h² (mom) or ρ̂ (gc), bounded for gc."""
         Z = Z.detach().to(self.device, self.dtype)
         if Z.shape[0] != self.n:
             raise ValueError(f"Z has {Z.shape[0]} rows; cohort has {self.n}")
 
-        # Fresh rebuild on the supplied Z (gradient-free; only used for
-        # display so we don't disturb the running state).
         u = torch.zeros((self.m, Z.shape[1]), device=self.device, dtype=self.dtype)
-        for j_lo, j_hi, _ in _stream_variant_chunks(
-            self.bed, self.row_idx, self.chunk
-        ):
+        for j_lo, j_hi in self._chunks():
             Xc = self._decode_chunk_std(j_lo, j_hi)
             u[j_lo:j_hi] = Xc.T @ Z
         w = self._W.T @ Z if self.has_W else None
@@ -472,17 +458,12 @@ class RankBHeritability(nn.Module):
         if self.mode == "mom":
             return self._mom_h2(u, w, Z, mu, sd)
 
-        # gc: ρ̂ = num / sqrt(d1 · d2), clamped to [-1, 1].
         Zs = (Z - mu) / sd
         num = (Zs * self._VKV_y2).sum(dim=0) * self.nc - (Zs * self._V_y2).sum(dim=0) * self.tr_pkp
-        # d1 = (y1s · VKV y1s) · nc − (y1s · V y1s) · tr_Ktil
-        # y1s · V y1s = ‖V y1s‖² = Zs^T V Zs = Zs^T Zs − Zs^T W (W'W)^{-1} W^T Zs
         WtZs = self._W.T @ Zs
         zz = (Zs * Zs).sum(dim=0)
         wwz = (WtZs * (self._WtW_inv @ WtZs)).sum(dim=0)
         q_p = zz - wwz
-        # y1s · VKV y1s = ‖X^T V y1s‖² / m
-        # X^T V y1s = u_std − M (W^T y1s),  u_std = u / sd (X^T 1 = 0).
         u_std = u / sd
         u_resid = u_std - self._M @ WtZs
         q_pkp = (u_resid * u_resid).sum(dim=0) / self.m
