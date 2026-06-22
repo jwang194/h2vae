@@ -53,7 +53,7 @@ class BedFile:
                 raise FileNotFoundError(f"PLINK file missing: {p}")
 
         self.sample_ids = self._parse_fam(fam_path)        # (n_total,)
-        self.variant_ids = self._parse_bim(bim_path)       # (m,)
+        self.variant_ids, self.a1, self.a2 = self._parse_bim(bim_path)
         self.n_total = len(self.sample_ids)
         self.m = len(self.variant_ids)
         self.bytes_per_variant = (self.n_total + 3) // 4
@@ -92,16 +92,25 @@ class BedFile:
         return np.asarray(ids, dtype=np.int64)
 
     @staticmethod
-    def _parse_bim(path: Path) -> np.ndarray:
-        """Return variant-ID column (index 1) as a string array."""
-        ids = []
+    def _parse_bim(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return ``(variant_ids, a1, a2)`` as parallel object arrays.
+
+        BIM column order is ``chrom varid genpos bp a1 a2``.
+        """
+        ids: list[str] = []
+        a1: list[str] = []
+        a2: list[str] = []
         with open(path) as f:
             for line in f:
                 fields = line.split()
                 if not fields:
                     continue
                 ids.append(fields[1])
-        return np.asarray(ids, dtype=object)
+                a1.append(fields[4] if len(fields) > 4 else "")
+                a2.append(fields[5] if len(fields) > 5 else "")
+        return (np.asarray(ids, dtype=object),
+                np.asarray(a1, dtype=object),
+                np.asarray(a2, dtype=object))
 
     # ------------------------------------------------------------------
     # Decoders
