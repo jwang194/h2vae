@@ -142,15 +142,27 @@ def _resolve_stream_key(streams: dict, split: str, chrom: str | None) -> tuple[s
 # Line plot helpers
 # ---------------------------------------------------------------------------
 
-def _plot_lines(ax, epochs, h_matrix, color, label):
-    """Plot mean (solid, with SD shading) and max (dashed) for one condition."""
-    mean = h_matrix.mean(axis=1)
-    std = h_matrix.std(axis=1)
-    mx = h_matrix.max(axis=1)
+def _plot_lines(ax, epochs, h_matrix, color, label, mask=None, value_name="h^2"):
+    """Plot mean (solid, with SD shading) and max (dashed) for one condition.
 
-    ax.plot(epochs, mean, color=color, linestyle="-", label=f"Mean $h^2$ ({label})")
+    If ``mask`` (same shape as ``h_matrix``) is provided, mean/std/max at each
+    epoch are computed only over latent dims where the mask is True.  Epochs
+    with no passing dim contribute NaN (and so leave a line gap).
+    """
+    if mask is None:
+        mean = h_matrix.mean(axis=1)
+        std = h_matrix.std(axis=1)
+        mx = h_matrix.max(axis=1)
+    else:
+        masked = np.where(mask, h_matrix, np.nan)
+        with np.errstate(invalid="ignore"):
+            mean = np.nanmean(masked, axis=1)
+            std = np.nanstd(masked, axis=1)
+            mx = np.nanmax(masked, axis=1)
+
+    ax.plot(epochs, mean, color=color, linestyle="-", label=f"Mean ${value_name}$ ({label})")
     ax.fill_between(epochs, mean - std, mean + std, color=color, alpha=0.2)
-    ax.plot(epochs, mx, color=color, linestyle="--", label=f"Max $h^2$ ({label})")
+    ax.plot(epochs, mx, color=color, linestyle="--", label=f"Max ${value_name}$ ({label})")
 
 
 # ---------------------------------------------------------------------------
@@ -185,18 +197,47 @@ def _add_significance_bracket(ax, x0, x1, y0, y1, pval):
             ha="center", va="bottom", fontsize=14)
 
 
+def _align_mask(value_epochs, value_matrix, mask_epochs, mask_matrix, threshold):
+    """Return a boolean mask aligned to ``value_epochs`` of shape ``value_matrix``.
+
+    For each value epoch, picks the nearest mask epoch and tests
+    ``mask_matrix[mask_idx] >= threshold``.  Shapes must match on the latent
+    axis.
+    """
+    if mask_matrix.shape[1] != value_matrix.shape[1]:
+        raise ValueError(
+            f"mask latent dim ({mask_matrix.shape[1]}) != value latent dim "
+            f"({value_matrix.shape[1]})"
+        )
+    idxs = np.array([
+        int(np.argmin(np.abs(mask_epochs - e))) for e in value_epochs
+    ])
+    return mask_matrix[idxs] >= threshold
+
+
 def plot_compare(
     ctrl_data: dict,
     exp_data: dict,
     out_path: str,
     stream_key: str,
     epoch: int | None = None,
+    ctrl_mask_data: dict | None = None,
+    exp_mask_data: dict | None = None,
+    mask_threshold: float | None = None,
+    value_name: str = "h^2",
+    absolute: bool = False,
 ) -> None:
     """Side-by-side comparison of control (h_weight=0) vs experiment.
 
-    Left panel: mean h² (with SD shading) and max h² for both runs on the
-    selected stream.  Right panel: seaborn violin + boxplot of per-latent h²
-    at the experiment's peak epoch, with Wilcoxon rank-sum p-value bracket.
+    Left panel: mean value (with SD shading) and max value for both runs on
+    the selected stream.  Right panel: seaborn violin + boxplot of per-latent
+    values at the experiment's peak epoch, with Wilcoxon rank-sum p-value
+    bracket.
+
+    If ``ctrl_mask_data`` / ``exp_mask_data`` (each parsed by ``parse_log``)
+    and ``mask_threshold`` are provided, per-dim values are included in the
+    line and violin panels only where the mask stream (e.g. MoM h²) on the
+    same split meets the threshold at the matching epoch.
     """
     fig, (ax_ts, ax_vln) = plt.subplots(1, 2, figsize=(20, 9))
 
@@ -204,17 +245,44 @@ def plot_compare(
 
     ctrl_h = ctrl_data["streams"][stream_key]
     exp_h = exp_data["streams"][stream_key]
+    if absolute:
+        ctrl_h = np.abs(ctrl_h)
+        exp_h = np.abs(exp_h)
 
     nice = stream_key.replace("_", " ")
-    y_label = f"$h^2$ ({nice})"
+    display_name = f"|{value_name}|" if absolute else value_name
+    y_label = f"${display_name}$ ({nice})"
+
+    ctrl_mask = None
+    exp_mask = None
+    if mask_threshold is not None:
+        if ctrl_mask_data is None or exp_mask_data is None:
+            raise ValueError(
+                "mask_threshold requires both ctrl_mask_data and exp_mask_data"
+            )
+        ctrl_mask = _align_mask(
+            ctrl_data["epochs"], ctrl_h,
+            ctrl_mask_data["epochs"], ctrl_mask_data["streams"][stream_key],
+            mask_threshold,
+        )
+        exp_mask = _align_mask(
+            exp_data["epochs"], exp_h,
+            exp_mask_data["epochs"], exp_mask_data["streams"][stream_key],
+            mask_threshold,
+        )
 
     # --- Left panel: time-series ---
-    _plot_lines(ax_ts, ctrl_data["epochs"], ctrl_h, c_ctrl, "Control")
-    _plot_lines(ax_ts, exp_data["epochs"], exp_h, c_exp, "Experiment")
+    _plot_lines(ax_ts, ctrl_data["epochs"], ctrl_h, c_ctrl, "Control",
+                mask=ctrl_mask, value_name=display_name)
+    _plot_lines(ax_ts, exp_data["epochs"], exp_h, c_exp, "Experiment",
+                mask=exp_mask, value_name=display_name)
 
     ax_ts.set_xlabel("Epoch")
     ax_ts.set_ylabel(y_label)
-    ax_ts.set_title(f"Heritability over training — {nice}")
+    title = f"${display_name}$ over training — {nice}"
+    if mask_threshold is not None:
+        title += f" (MoM $h^2 \\geq$ {mask_threshold})"
+    ax_ts.set_title(title)
     ax_ts.axhline(0, color="grey", linewidth=0.5, linestyle=":")
     ax_ts.legend(fontsize=14)
 
@@ -223,14 +291,23 @@ def plot_compare(
         peak_idx = int(np.argmin(np.abs(exp_data["epochs"] - epoch)))
         peak_epoch = exp_data["epochs"][peak_idx]
     else:
-        exp_mean = exp_h.mean(axis=1)
-        peak_idx = int(np.argmax(exp_mean))
+        if exp_mask is None:
+            peak_series = exp_h.mean(axis=1)
+        else:
+            masked = np.where(exp_mask, exp_h, np.nan)
+            with np.errstate(invalid="ignore"):
+                peak_series = np.nanmean(masked, axis=1)
+        peak_idx = int(np.nanargmax(peak_series))
         peak_epoch = exp_data["epochs"][peak_idx]
 
     ctrl_idx = int(np.argmin(np.abs(ctrl_data["epochs"] - peak_epoch)))
 
     h_ctrl = ctrl_h[ctrl_idx]
     h_exp = exp_h[peak_idx]
+    if ctrl_mask is not None:
+        h_ctrl = h_ctrl[ctrl_mask[ctrl_idx]]
+    if exp_mask is not None:
+        h_exp = h_exp[exp_mask[peak_idx]]
 
     df = pd.DataFrame({
         y_label: np.concatenate([h_ctrl, h_exp]),
@@ -354,6 +431,20 @@ def main() -> None:
     p_cmp.add_argument("experiment_log", type=str, help="Path to the experiment log file")
     _add_stream_flags(p_cmp)
     p_cmp.add_argument("--epoch", type=int, default=None, help="Epoch for violin plot (default: peak mean h² epoch)")
+    p_cmp.add_argument("--mask-log-ctrl", type=str, default=None,
+                       help="Optional companion log (e.g. MoM-rerun log) for the control run; "
+                            "the same stream is used as a per-dim, per-epoch mask via --mask-threshold")
+    p_cmp.add_argument("--mask-log-exp", type=str, default=None,
+                       help="Optional companion log for the experiment run (paired with --mask-log-ctrl)")
+    p_cmp.add_argument("--mask-threshold", type=float, default=None,
+                       help="Threshold applied to the mask logs: include only latent dims where "
+                            "the mask stream is >= this value at the matching epoch")
+    p_cmp.add_argument("--value-name", type=str, default="h^2",
+                       help="LaTeX-style label for the plotted quantity (default: h^2; use e.g. "
+                            "'\\hat{\\rho}' for genetic correlation)")
+    p_cmp.add_argument("--abs", action="store_true", default=False,
+                       help="Plot |value| instead of signed value (useful for genetic "
+                            "correlation, whose sign is latent-orientation-arbitrary)")
     p_cmp.add_argument("--out", type=str, default=None,
                        help="Output image path (default: "
                             "<exp_log_dir>/plots/<exp_log_stem>.<split>[_<chrom>].compare.png)")
@@ -383,9 +474,34 @@ def main() -> None:
                 f"stream {stream_key!r} not in control log "
                 f"(available: {sorted(ctrl_data['streams'])})"
             )
+        ctrl_mask_data = None
+        exp_mask_data = None
+        if args.mask_threshold is not None:
+            if args.mask_log_ctrl is None or args.mask_log_exp is None:
+                parser.error("--mask-threshold requires --mask-log-ctrl and --mask-log-exp")
+            ctrl_mask_data = _load_log(args.mask_log_ctrl)
+            exp_mask_data = _load_log(args.mask_log_exp)
+            for mname, mdata in (("ctrl", ctrl_mask_data), ("exp", exp_mask_data)):
+                if stream_key not in mdata["streams"]:
+                    raise ValueError(
+                        f"stream {stream_key!r} not in {mname} mask log "
+                        f"(available: {sorted(mdata['streams'])})"
+                    )
         suffix = _stream_suffix(args.split, args.chrom, is_split) + ".compare"
+        if args.mask_threshold is not None:
+            suffix += f".mask{args.mask_threshold}"
+        if args.abs:
+            suffix += ".abs"
         out_path = args.out or _default_plot_path(args.experiment_log, suffix=suffix)
-        plot_compare(ctrl_data, exp_data, out_path, stream_key, epoch=args.epoch)
+        plot_compare(
+            ctrl_data, exp_data, out_path, stream_key,
+            epoch=args.epoch,
+            ctrl_mask_data=ctrl_mask_data,
+            exp_mask_data=exp_mask_data,
+            mask_threshold=args.mask_threshold,
+            value_name=args.value_name,
+            absolute=args.abs,
+        )
 
     elif args.command == "linear_max":
         if args.out is not None:
