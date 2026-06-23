@@ -49,26 +49,29 @@ def _compile_kernel():
         float* __restrict__ out                // (n × chunk_var) row-major
     ) {
         int j_byte = blockIdx.x * blockDim.x + threadIdx.x;
-        int i      = blockIdx.y;
-        if (j_byte >= byte_count || i >= n) return;
-
-        uint8_t b = packed[i * byte_count + j_byte];
+        if (j_byte >= byte_count) return;
         int j_base = j_byte * 4;
-        float* out_row = out + i * chunk_var;
 
-        #pragma unroll
-        for (int l = 0; l < 4; l++) {
-            int j = j_base + l;
-            if (j >= chunk_var) break;
-            int code = (b >> (l * 2)) & 0x3;
-            float v;
-            if (code == 3) {
-                // missing → mean-imputed → 0 in standardised space
-                v = 0.0f;
-            } else {
-                v = (static_cast<float>(code) - mean[j]) / sd[j];
+        // Grid-stride loop on sample axis: gridDim.y is capped at 65535
+        // (CUDA limit), so each block iterates if n is larger.
+        for (int i = blockIdx.y; i < n; i += gridDim.y) {
+            uint8_t b = packed[i * byte_count + j_byte];
+            float* out_row = out + i * chunk_var;
+
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                int j = j_base + l;
+                if (j >= chunk_var) break;
+                int code = (b >> (l * 2)) & 0x3;
+                float v;
+                if (code == 3) {
+                    // missing → mean-imputed → 0 in standardised space
+                    v = 0.0f;
+                } else {
+                    v = (static_cast<float>(code) - mean[j]) / sd[j];
+                }
+                out_row[j] = v;
             }
-            out_row[j] = v;
         }
     }
 
@@ -98,8 +101,10 @@ def _compile_kernel():
         TORCH_CHECK(sd.size(0) == chunk_var,   "sd.size(0) must equal chunk_var");
 
         const int threads = 256;
+        const int max_grid_y = 65535;
+        int grid_y = n < max_grid_y ? n : max_grid_y;
         dim3 block(threads);
-        dim3 grid((byte_count + threads - 1) / threads, n);
+        dim3 grid((byte_count + threads - 1) / threads, grid_y);
 
         decode_and_standardise_kernel<<<grid, block>>>(
             packed.data_ptr<uint8_t>(),
