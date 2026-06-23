@@ -128,8 +128,16 @@ def main() -> None:
         train_idx = np.array([id_to_idx[i] for i in train_ids])
         val_idx = np.array([id_to_idx[i] for i in val_ids])
 
-        train_images = torch.tensor(images_raw[train_idx].astype(np.float32).transpose((0, 3, 1, 2)))
-        val_images = torch.tensor(images_raw[val_idx].astype(np.float32).transpose((0, 3, 1, 2)))
+        def _to_tensor(a):  # match h2vae/data.py: handle 2D/3D(1D model)/4D(2D model)
+            a = a.astype(np.float32)
+            if a.ndim == 4:        # (n,h,w,c) -> (n,c,h,w)  [vae2d]
+                a = a.transpose((0, 3, 1, 2))
+            elif a.ndim == 2:      # (n,L) -> (n,1,L)         [vae1d]
+                a = a[:, None, :]
+            # ndim==3 (n,c,L): already channels-leading [vae1d]
+            return torch.tensor(a)
+        train_images = _to_tensor(images_raw[train_idx])
+        val_images = _to_tensor(images_raw[val_idx])
 
         train_dataset = ImageDataset(train_images, torch.tensor(train_ids.astype(np.float32)))
         val_dataset = ImageDataset(val_images, torch.tensor(val_ids.astype(np.float32)))
