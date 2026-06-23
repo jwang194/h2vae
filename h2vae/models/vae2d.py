@@ -89,6 +89,7 @@ class VAE(BaseVAE):
         external: int = 0,
         act: str = "elu",
         beta: float = 1.0,
+        zs_floor: float = 0.0,
     ):
         super().__init__()
 
@@ -97,6 +98,7 @@ class VAE(BaseVAE):
         self.size_flat = self.red_img_size ** 2 * nf
         self.K = img_size ** 2 * colors
         self.beta = beta
+        self.zs_floor = float(zs_floor)
         ks = 3
 
         # Encoder
@@ -122,6 +124,10 @@ class VAE(BaseVAE):
         x = x.view(-1, self.size_flat)
         zm = self.dense_zm(x)
         zs = F.softplus(self.dense_zs(x))
+        # Optional posterior-std floor (--zs-floor, default off); keeps log(zs)
+        # finite when the encoder drives zs->0 (see vae3d for the empirical detail).
+        if self.zs_floor > 0:
+            zs = zs.clamp_min(self.zs_floor)
         return zm, zs
 
     def decode(self, z: Tensor, external: Tensor | None = None) -> Tensor:

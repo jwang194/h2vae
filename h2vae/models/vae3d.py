@@ -113,6 +113,7 @@ class VAE3D(BaseVAE):
         act: str = "leaky_relu",
         beta: float = 1.0,
         gradient_checkpointing: bool = False,
+        zs_floor: float = 0.0,
     ):
         super().__init__()
 
@@ -125,6 +126,7 @@ class VAE3D(BaseVAE):
         self.red_img_size = img_size // (2 ** steps)
         self.K = img_size ** 3 * colors
         self.beta = beta
+        self.zs_floor = float(zs_floor)
         ks = 3
 
         # Build channel schedule: [colors, nf, 2*nf, 4*nf, ...]
@@ -171,6 +173,14 @@ class VAE3D(BaseVAE):
         x = x.view(-1, self.size_flat)
         zm = self.dense_zm(x)
         zs = F.softplus(self.dense_zs(x))
+        # Optional posterior-std floor (--zs-floor, default off). Empirically
+        # (instrumented β=1 spectrum probe, 2026-06-12) the encoder drives zs
+        # progressively to exactly 0.0 for several dims; log(zs)=-inf in the KL then
+        # produces a NaN that propagates through the latent means and surfaces as the
+        # spectrum Cholesky failure. A small floor (e.g. 1e-8) keeps log(zs) finite
+        # and prevents that NaN cascade. zs_floor=0 reproduces legacy (no clamp).
+        if self.zs_floor > 0:
+            zs = zs.clamp_min(self.zs_floor)
         return zm, zs
 
     def decode(self, z: Tensor, external: Tensor | None = None) -> Tensor:

@@ -34,6 +34,7 @@ from h2vae.models import get_model_class
 from h2vae.models.base import BaseVAE
 from h2vae.heritability import mom, var_exp, gc
 from h2vae.rank_b_heritability import RankBHeritability
+from h2vae.rank_b_spectrum import RankBHeritabilitySpectrum
 from h2vae.data import (
     ImageDataset, ImageFileDataset, load_data, load_genetics_reindexed,
     make_streaming_dataset,
@@ -94,6 +95,37 @@ class HVAEConfig:
     split_variants: bool = False
     genetic_correlation: str | None = None  # HDF5 with target phenotype (switches loss to gc)
 
+    # External genetic-correlation via differentiable LDSC against an out-of-cohort
+    # trait (rank-B PLINK path only). Adds a per-step rg loss vs the munged sumstats;
+    # --hweights selects which dims are pressured. See h2vae.rank_b_gencorr_ldsc.
+    rg_ldsc_sumstats: str | None = None
+    rg_ldsc_ref_ld_chr: str | None = None
+    rg_ldsc_w_ld_chr: str | None = None
+    rg_ldsc_intercept_hsq: float | None = None
+    rg_ldsc_intercept_gencov: float | None = None
+    rg_ldsc_chroms: str | None = None
+
+    # Heritability-spectrum objective (linearly-accessible heritability; PLINK path only).
+    # Maximizes the generalized-eigenvalue spectrum of G v = λ P v instead of per-dim h².
+    # With --linear-heritability, --hweights is reinterpreted as per-RANK spectrum weights.
+    linear_heritability: bool = False
+    spectrum_ridge: float = 1e-4
+    spectrum_clamp: bool = False  # relu(λ) before the weighted sum (differentiable nearest-PSD)
+    # Relative weights of the two heritability sub-objectives under --linear-heritability:
+    # total her loss = spectrum_weight*spectrum_loss + marginal_weight*(−Σ_d h²_d).
+    # marginal_weight>0 also grows the per-dim (single-latent) heritabilities.
+    spectrum_weight: float = 1.0
+    marginal_weight: float = 0.0
+    # Restrict the spectrum objective to the first K latent dims (G[:K,:K], P[:K,:K]),
+    # leaving dims K..zdim-1 free for reconstruction. 0 = full zdim (no restriction).
+    # Anti-overfitting knob for large latent sets, distinct from per-rank --hweights.
+    spectrum_dims: int = 0
+    # Optional encoder posterior-std floor: zs = softplus(...).clamp_min(zs_floor).
+    # 0.0 (default) = legacy (no floor). Set e.g. 1e-8 to stop zs underflowing to 0,
+    # which causes log(zs)=-inf in the KL and a NaN that surfaces as the spectrum
+    # Cholesky failure at low beta. General-purpose; applies to all model variants.
+    zs_floor: float = 0.0
+
     # Covariates (independent pathways, activated by file presence)
     decode_covariates: str | None = None
     residualize_covariates: str | None = None
@@ -113,6 +145,8 @@ class HVAEConfig:
             cfg["steps"] = self.steps
         if self.gradient_checkpointing:
             cfg["gradient_checkpointing"] = True
+        if self.zs_floor > 0:
+            cfg["zs_floor"] = self.zs_floor
         return cfg
 
     @property
@@ -178,6 +212,44 @@ def parse_args() -> HVAEConfig:
     parser.add_argument("--genetic-correlation", type=str, default=None,
                         help="HDF5 (keys 'data', 'ids') of a target phenotype; switches the loss "
                              "to per-latent SCORE-OVERLAP genetic correlation with this phenotype")
+    parser.add_argument("--rg-ldsc-sumstats", type=str, default=None,
+                        help="munged .sumstats.gz of an external trait; adds a differentiable "
+                             "LDSC genetic-covariance loss against it (displayed as rg). Requires "
+                             "the PLINK rank-B path (incompatible with --kinship, --r2, "
+                             "--genetic-correlation)")
+    parser.add_argument("--rg-ldsc-ref-ld-chr", type=str, default=None,
+                        help="per-chrom reference LD-score prefix (LDSC --ref-ld-chr)")
+    parser.add_argument("--rg-ldsc-w-ld-chr", type=str, default=None,
+                        help="per-chrom regression-weight LD-score prefix (LDSC --w-ld-chr)")
+    parser.add_argument("--rg-ldsc-intercept-hsq", type=float, default=None,
+                        help="fix both h2 intercepts to this value (default: free, absorbs "
+                             "residual stratification)")
+    parser.add_argument("--rg-ldsc-intercept-gencov", type=float, default=None,
+                        help="fix the gencov intercept to this value (default: free, absorbs "
+                             "sample overlap)")
+    parser.add_argument("--rg-ldsc-chroms", type=str, default=None,
+                        help="restrict rg-ldsc to these chroms: e.g. '1', '1-22', '1,2,3' "
+                             "(default: all of 1-22)")
+    parser.add_argument("--linear-heritability", action="store_true", default=False,
+                        help="maximize the heritability SPECTRUM (tr(P⁻¹G)) instead of per-dim h²; "
+                             "PLINK path only. --hweights becomes per-rank spectrum weights")
+    parser.add_argument("--spectrum-ridge", type=float, default=HVAEConfig.spectrum_ridge,
+                        help="ridge added to the phenotypic correlation P before whitening")
+    parser.add_argument("--spectrum-clamp", action="store_true", default=False,
+                        help="clamp the spectrum at 0 (relu) before the weighted sum")
+    parser.add_argument("--spectrum-weight", type=float, default=HVAEConfig.spectrum_weight,
+                        help="coefficient on the spectrum loss (with --linear-heritability)")
+    parser.add_argument("--marginal-weight", type=float, default=HVAEConfig.marginal_weight,
+                        help="coefficient on the marginal per-dim heritability loss "
+                             "(−Σ_d h²_d); >0 also grows single-latent heritabilities")
+    parser.add_argument("--spectrum-dims", type=int, default=HVAEConfig.spectrum_dims,
+                        help="restrict the spectrum objective to the first K latent dims "
+                             "(G[:K,:K], P[:K,:K]); 0=full zdim. With --linear-heritability, "
+                             "--hweights must then be at least length K (sliced to [:K])")
+    parser.add_argument("--zs-floor", type=float, default=HVAEConfig.zs_floor,
+                        help="floor for the encoder posterior std: softplus(...).clamp_min(zs_floor). "
+                             "0=off (legacy). e.g. 1e-8 stops zs underflowing to 0 -> log(zs) NaN "
+                             "(the spectrum-loss crash at low beta).")
 
     # Covariates
     parser.add_argument("--decode-covariates", type=str, default=None, help="text file of covariate names for decode conditioning")
@@ -218,6 +290,19 @@ def parse_args() -> HVAEConfig:
         r2=args.r2,
         split_variants=args.split_variants,
         genetic_correlation=args.genetic_correlation,
+        rg_ldsc_sumstats=args.rg_ldsc_sumstats,
+        rg_ldsc_ref_ld_chr=args.rg_ldsc_ref_ld_chr,
+        rg_ldsc_w_ld_chr=args.rg_ldsc_w_ld_chr,
+        rg_ldsc_intercept_hsq=args.rg_ldsc_intercept_hsq,
+        rg_ldsc_intercept_gencov=args.rg_ldsc_intercept_gencov,
+        rg_ldsc_chroms=args.rg_ldsc_chroms,
+        linear_heritability=args.linear_heritability,
+        spectrum_ridge=args.spectrum_ridge,
+        spectrum_clamp=args.spectrum_clamp,
+        spectrum_weight=args.spectrum_weight,
+        marginal_weight=args.marginal_weight,
+        spectrum_dims=args.spectrum_dims,
+        zs_floor=args.zs_floor,
         decode_covariates=args.decode_covariates,
         residualize_covariates=args.residualize_covariates,
         which_cuda=args.which_cuda,
@@ -333,14 +418,37 @@ class HeritabilityState:
     loss_fn_odd: Callable | None = None
     val_fn_odd: Callable | None = None
 
-    # Rank-B modules (PLINK path)
-    rank_b: RankBHeritability | None = None
-    rank_b_val: RankBHeritability | None = None
-    rank_b_odd: RankBHeritability | None = None
-    rank_b_val_odd: RankBHeritability | None = None
+    # Rank-B modules (PLINK path). RankBHeritabilitySpectrum is a subclass, so
+    # the runtime type is compatible; the annotation is widened for clarity.
+    rank_b: RankBHeritability | RankBHeritabilitySpectrum | None = None
+    rank_b_val: RankBHeritability | RankBHeritabilitySpectrum | None = None
+    rank_b_odd: RankBHeritability | RankBHeritabilitySpectrum | None = None
+    rank_b_val_odd: RankBHeritability | RankBHeritabilitySpectrum | None = None
 
     cov_state: CovariateState = None  # type: ignore[assignment]
     hweights: Tensor | None = None
+
+
+def _parse_chroms_spec(spec: str | None) -> list[int]:
+    """Parse a ``--rg-ldsc-chroms`` spec into a list of chromosome ints.
+
+    Accepts ``None`` (-> 1..22), a single chrom (``"7"``), an inclusive
+    range (``"1-22"``), a comma-list (``"1,2,3"``), or combinations
+    (``"1-4,8"``).
+    """
+    if spec is None:
+        return list(range(1, 23))
+    chroms: list[int] = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-")
+            chroms.extend(range(int(lo), int(hi) + 1))
+        else:
+            chroms.append(int(part))
+    return chroms
 
 
 def setup_heritability(
@@ -362,6 +470,24 @@ def setup_heritability(
         raise ValueError("--r2 and --kinship are mutually exclusive")
     if cfg.r2 and cfg.genetic_correlation is not None:
         raise ValueError("--r2 and --genetic-correlation are mutually exclusive")
+    if cfg.linear_heritability and (cfg.r2 or cfg.kinship or cfg.genetic_correlation is not None):
+        raise ValueError(
+            "--linear-heritability is the PLINK rank-B path only; it is "
+            "incompatible with --r2, --kinship, and --genetic-correlation"
+        )
+    if cfg.rg_ldsc_sumstats is not None:
+        if cfg.r2 or cfg.kinship:
+            raise ValueError("--rg-ldsc-sumstats requires the PLINK rank-B path "
+                             "(incompatible with --r2 / --kinship)")
+        if cfg.genetic_correlation is not None:
+            raise ValueError("--rg-ldsc-sumstats and --genetic-correlation are "
+                             "mutually exclusive (external vs. in-cohort gc)")
+        if cfg.linear_heritability:
+            raise ValueError("--rg-ldsc-sumstats and --linear-heritability are "
+                             "mutually exclusive (both wrap the rank-B objective)")
+        if cfg.rg_ldsc_ref_ld_chr is None or cfg.rg_ldsc_w_ld_chr is None:
+            raise ValueError("--rg-ldsc-sumstats requires --rg-ldsc-ref-ld-chr "
+                             "and --rg-ldsc-w-ld-chr")
 
     device = cfg.device
     cov_state = CovariateState()
@@ -429,20 +555,39 @@ def setup_heritability(
         row_idx_val = row_idx_full[n_train:]
         bed = BedFile(plink_prefix)
 
-        h_state.rank_b = RankBHeritability(
-            bed, row_idx_train,
-            C=C_resid_train,
-            y_target=y2_train if use_gc else None,
-            hweights=hweights_tensor,
-            device=device,
-        )
-        h_state.rank_b_val = RankBHeritability(
-            bed, row_idx_val,
-            C=C_resid_val,
-            y_target=y2_val if use_gc else None,
-            hweights=hweights_tensor,
-            device=device,
-        )
+        # Pick the rank-B estimator class.  --linear-heritability swaps the
+        # per-dim objective for the heritability-SPECTRUM objective
+        # (RankBHeritabilitySpectrum); --hweights then acts as per-rank weights.
+        if cfg.linear_heritability:
+            if use_gc:
+                raise ValueError(
+                    "--linear-heritability is incompatible with --genetic-correlation"
+                )
+
+            def _make_rank_b(_bed, _row_idx, _C, _y_target):
+                return RankBHeritabilitySpectrum(
+                    _bed, _row_idx,
+                    C=_C,
+                    ridge=cfg.spectrum_ridge,
+                    spectrum_clamp=cfg.spectrum_clamp,
+                    rank_weights=hweights_tensor,
+                    spectrum_dims=cfg.spectrum_dims,
+                    spectrum_weight=cfg.spectrum_weight,
+                    marginal_weight=cfg.marginal_weight,
+                    device=device,
+                )
+        else:
+            def _make_rank_b(_bed, _row_idx, _C, _y_target):
+                return RankBHeritability(
+                    _bed, _row_idx,
+                    C=_C,
+                    y_target=_y_target if use_gc else None,
+                    hweights=hweights_tensor,
+                    device=device,
+                )
+
+        h_state.rank_b = _make_rank_b(bed, row_idx_train, C_resid_train, y2_train)
+        h_state.rank_b_val = _make_rank_b(bed, row_idx_val, C_resid_val, y2_val)
 
         if cfg.split_variants:
             odd_genetics = data.get("genetics_odd", {})
@@ -454,20 +599,65 @@ def setup_heritability(
                 )
             odd_row_idx_full = odd_genetics["plink_row_idx"]
             bed_odd = BedFile(odd_prefix)
-            h_state.rank_b_odd = RankBHeritability(
-                bed_odd, odd_row_idx_full[:n_train],
-                C=C_resid_train,
-                y_target=y2_train if use_gc else None,
-                hweights=hweights_tensor,
-                device=device,
+            h_state.rank_b_odd = _make_rank_b(
+                bed_odd, odd_row_idx_full[:n_train], C_resid_train, y2_train)
+            h_state.rank_b_val_odd = _make_rank_b(
+                bed_odd, odd_row_idx_full[n_train:], C_resid_val, y2_val)
+
+        # --- External LDSC genetic-correlation: wrap the rank-B modules ------
+        # RankBGenCorrLDSC is a duck-typed drop-in (rebuild / update_and_loss /
+        # display); it optimizes the genetic COVARIANCE vs an external trait and
+        # exposes per-dim rg (last_rg), gencov (last_gencov), and the IRWLS
+        # intercepts (last_intercepts) for the per-epoch diagnostics.
+        if cfg.rg_ldsc_sumstats is not None:
+            from h2vae.ldsc_io import build_ldsc_context
+            from h2vae.rank_b_gencorr_ldsc import RankBGenCorrLDSC
+
+            chroms = _parse_chroms_spec(cfg.rg_ldsc_chroms)
+            ctx = build_ldsc_context(
+                cfg.rg_ldsc_sumstats,
+                cfg.rg_ldsc_ref_ld_chr, cfg.rg_ldsc_w_ld_chr,
+                bed_variant_ids=bed.variant_ids,
+                bed_a1=bed.a1, bed_a2=bed.a2,
+                chroms=chroms,
             )
-            h_state.rank_b_val_odd = RankBHeritability(
-                bed_odd, odd_row_idx_full[n_train:],
-                C=C_resid_val,
-                y_target=y2_val if use_gc else None,
-                hweights=hweights_tensor,
-                device=device,
+            logging.info(
+                f"[rg-ldsc] aligned {ctx.m_use} SNPs (from {ctx.n_total_input} "
+                f"in sumstats, {ctx.n_annot} ref-LD annotations) for rg loss"
             )
+            h_state.rank_b = RankBGenCorrLDSC(
+                h_state.rank_b, ctx,
+                intercept_hsq=cfg.rg_ldsc_intercept_hsq,
+                intercept_gencov=cfg.rg_ldsc_intercept_gencov,
+                hweights=hweights_tensor,
+            )
+            h_state.rank_b_val = RankBGenCorrLDSC(
+                h_state.rank_b_val, ctx,
+                intercept_hsq=cfg.rg_ldsc_intercept_hsq,
+                intercept_gencov=cfg.rg_ldsc_intercept_gencov,
+                hweights=hweights_tensor,
+            )
+            if cfg.split_variants:
+                ctx_odd = build_ldsc_context(
+                    cfg.rg_ldsc_sumstats,
+                    cfg.rg_ldsc_ref_ld_chr, cfg.rg_ldsc_w_ld_chr,
+                    bed_variant_ids=bed_odd.variant_ids,
+                    bed_a1=bed_odd.a1, bed_a2=bed_odd.a2,
+                    chroms=chroms,
+                )
+                logging.info(f"[rg-ldsc] odd: aligned {ctx_odd.m_use} SNPs")
+                h_state.rank_b_odd = RankBGenCorrLDSC(
+                    h_state.rank_b_odd, ctx_odd,
+                    intercept_hsq=cfg.rg_ldsc_intercept_hsq,
+                    intercept_gencov=cfg.rg_ldsc_intercept_gencov,
+                    hweights=hweights_tensor,
+                )
+                h_state.rank_b_val_odd = RankBGenCorrLDSC(
+                    h_state.rank_b_val_odd, ctx_odd,
+                    intercept_hsq=cfg.rg_ldsc_intercept_hsq,
+                    intercept_gencov=cfg.rg_ldsc_intercept_gencov,
+                    hweights=hweights_tensor,
+                )
         return h_state
 
     # --- Build heritability estimators (kinship or --r2 genotype-HDF5 path) ---
@@ -816,6 +1006,7 @@ def validate_epoch(
     h_state: HeritabilityState,
     cfg: HVAEConfig,
     epoch: int,
+    Zm_train: Tensor | None = None,
 ) -> dict:
     """Run validation: encode, compute MSE and heritability.
 
@@ -868,6 +1059,57 @@ def validate_epoch(
         result["her_estimates_val"] = _compute_her_estimates(Zm, h_state.val_fn)
         if cfg.split_variants:
             result["her_estimates_val_odd"] = _compute_her_estimates(Zm, h_state.val_fn_odd)
+
+    # rg-ldsc: the display() above populated last_gencov / last_intercepts /
+    # last_skipped on the wrapper. Stash the val gencov for the flush log line
+    # and emit the per-epoch IRWLS-intercept diagnostic (mean±std across dims).
+    if cfg.rg_ldsc_sumstats is not None and h_state.rank_b_val is not None:
+        rb = h_state.rank_b_val
+        result["gencov_val"] = rb.last_gencov.tolist()
+        ints = rb.last_intercepts
+
+        def _ms(t: torch.Tensor) -> tuple[float, float]:
+            v = t[~torch.isnan(t)]
+            if v.numel() == 0:
+                return float("nan"), float("nan")
+            return float(v.mean()), float(v.std())
+
+        h1m, h1s = _ms(ints["hsq1"])
+        h2m, h2s = _ms(ints["hsq2"])
+        gcm, gcs = _ms(ints["gencov"])
+        logging.info(
+            "rg_ldsc_intercepts_val (epoch %d): hsq1=%.3f±%.3f  "
+            "hsq2=%.3f±%.3f  gencov=%.3f±%.3f  skipped=%d/%d",
+            epoch, h1m, h1s, h2m, h2s, gcm, gcs,
+            len(rb.last_skipped), len(result["her_estimates_val"]),
+        )
+
+    # Heritability-spectrum objective: additionally report the val spectrum and
+    # persist it (the per-dim h² above stays as-is). spectrum_display() exists
+    # only on RankBHeritabilitySpectrum.
+    if cfg.linear_heritability and h_state.rank_b_val is not None:
+        spec, total = h_state.rank_b_val.spectrum_display(Zm)
+        result["spectrum_val"] = spec.detach().cpu().tolist()
+        result["spectrum_total_val"] = float(total)
+        np.savetxt(
+            os.path.join(cfg.outdir, "latents", f"spectrum_val.{epoch:05d}.txt"),
+            spec.detach().cpu().numpy(),
+            delimiter="\t",
+        )
+        # Held-out spectrum: score the TRAIN-optimal directions on val data.
+        # W_train is fit on train latents; evaluated on val's own (G,P) it gives
+        # the unbiased generalization of the spectrum (overfit directions deflate).
+        if Zm_train is not None and h_state.rank_b is not None:
+            _, W_train = h_state.rank_b.eig_decompose(Zm_train)
+            held = h_state.rank_b_val.heritability_of_directions(Zm, W_train)
+            held = held.detach().cpu()
+            result["spectrum_val_heldout"] = held.tolist()
+            result["spectrum_total_val_heldout"] = float(held.sum())
+            np.savetxt(
+                os.path.join(cfg.outdir, "latents",
+                             f"spectrum_val_heldout.{epoch:05d}.txt"),
+                held.numpy(), delimiter="\t",
+            )
 
     return result
 
@@ -1083,6 +1325,44 @@ def main() -> None:
                 ", ".join(f"{h:.3f}" for h in val["her_estimates_val"]),
             )
 
+        # rg-ldsc: log the optimized per-dim genetic COVARIANCE (train + val).
+        # rank_b.display(Zm_for_train) above set last_gencov for train; val
+        # gencov was stashed by validate_epoch.
+        if cfg.rg_ldsc_sumstats is not None and h_state.rank_b is not None:
+            gencov_tr = h_state.rank_b.last_gencov.tolist()
+            gencov_va = val.get("gencov_val", [])
+            logging.info(
+                "epoch %d - gencov_train: %s - gencov_val: %s",
+                prev_epoch,
+                ", ".join(f"{g:+.4e}" for g in gencov_tr),
+                ", ".join(f"{g:+.4e}" for g in gencov_va),
+            )
+
+        # Heritability-spectrum objective: additionally log the spectrum total +
+        # top-5 and persist the train spectrum (additive; no log line removed).
+        if cfg.linear_heritability and h_state.rank_b is not None:
+            spec_tr, tot_tr = h_state.rank_b.spectrum_display(Zm_for_train)
+            spec_tr = spec_tr.detach().cpu()
+            np.savetxt(
+                os.path.join(ldir, f"spectrum_train.{prev_epoch:05d}.txt"),
+                spec_tr.numpy(),
+                delimiter="\t",
+            )
+            spec_val = val.get("spectrum_val", [])
+            spec_held = val.get("spectrum_val_heldout", [])
+            logging.info(
+                "epoch %d - h2_total_train: %.4f - top5_train: %s"
+                " - h2_total_val: %.4f - top5_val: %s"
+                " - h2_total_val_heldout: %.4f - top5_val_heldout: %s",
+                prev_epoch,
+                float(tot_tr),
+                ", ".join(f"{x:.3f}" for x in spec_tr[:5].tolist()),
+                val.get("spectrum_total_val", float("nan")),
+                ", ".join(f"{x:.3f}" for x in spec_val[:5]),
+                val.get("spectrum_total_val_heldout", float("nan")),
+                ", ".join(f"{x:.3f}" for x in spec_held[:5]),
+            )
+
     pending: dict | None = None
     for epoch in range(start_epoch, cfg.epochs):
         train_metrics = train_epoch(vae, train_loader, optimizer, h_state, cfg, epoch)
@@ -1091,7 +1371,8 @@ def main() -> None:
         # Use this epoch's start-of-epoch Zm to flush previous epoch's display.
         _flush_pending(pending, Zm_start)
 
-        val_metrics = validate_epoch(vae, val_loader, h_state, cfg, epoch)
+        val_metrics = validate_epoch(vae, val_loader, h_state, cfg, epoch,
+                                     Zm_train=Zm_start)
 
         pending = {
             "epoch": epoch,

@@ -334,14 +334,15 @@ def gc(
     n = X.shape[0]
     K = X if kinship else (X @ X.T) / X.shape[1]
     K = K.to(device)
-    y2 = y2.to(device)
+    y2 = y2.to(device, K.dtype)
     if y2.ndim == 1:
         y2 = y2[:, None]
 
+    ones = torch.ones((n, 1), device=device, dtype=K.dtype)
     if C is None:
-        W = torch.ones((n, 1), device=device)
+        W = ones
     else:
-        W = torch.hstack((torch.ones((n, 1), device=device), C.to(device)))
+        W = torch.hstack((ones, C.to(device, K.dtype)))
     c = W.shape[1]
     nc = n - c
 
@@ -399,6 +400,89 @@ def gc(
         return torch.clamp(num / torch.sqrt(d1 * d2), min=-1.0, max=1.0)
 
     loss.display = display
+    return loss
+
+
+# ---------------------------------------------------------------------------
+# Heritability-spectrum dense reference (test/eval oracle for rank-B spectrum)
+# ---------------------------------------------------------------------------
+
+def gcov_spectrum(
+    X: Tensor,
+    C: Tensor | None = None,
+    kinship: bool = False,
+    ridge: float = 1e-4,
+    device: torch.device = torch.device("cpu"),
+) -> Callable[[Tensor], tuple[Tensor, Tensor, Tensor]]:
+    """Dense reference for the heritability spectrum (no rank-B).
+
+    The full pairwise genetic-covariance matrix ``G`` is the SCORE-OVERLAP
+    estimator :func:`gc` applied to every latent pair; ``P_corr`` is the
+    residualized phenotypic *correlation* matrix; the spectrum is the
+    generalized eigenvalues of ``G v = λ P_corr v``.  See
+    ``notes/SPECTRUM-MATH.md``.  This is the dense analogue of
+    :class:`h2vae.rank_b_spectrum.RankBHeritabilitySpectrum`, used to validate
+    the rank-B implementation; it is not used as a training loss.
+
+    To match ``gc()`` / the rank-B estimator, an intercept column is prepended
+    to ``C`` (so ``W=[1|C]``; ``W=[1]`` when ``C=None``).
+
+    Args:
+        X: genotype matrix ``(n, m)`` (standardized) or GRM ``(n, n)`` if
+            ``kinship``.
+        C: residualization covariates ``(n, c_user)`` without an intercept, or
+            ``None``.
+        kinship: treat ``X`` as a precomputed GRM.
+        ridge: ridge added to ``P_corr`` before whitening.
+        device: torch device.
+
+    Returns:
+        ``loss(Z) -> (G, P_corr, spectrum)`` where ``Z`` is ``(n, d)``; ``G`` and
+        ``P_corr`` are ``(d, d)`` and ``spectrum`` is the descending ``(d,)``
+        generalized eigenvalues.
+    """
+    X = X.to(device)
+    n = X.shape[0]
+    K = X if kinship else (X @ X.T) / X.shape[1]
+
+    ones = torch.ones((n, 1), device=device, dtype=X.dtype)
+    W = ones if C is None else torch.hstack((ones, C.to(device, X.dtype)))
+    c = W.shape[1]
+    nc = float(n - c)
+
+    WtW_inv = torch.linalg.inv(W.T @ W)
+    V = torch.eye(n, device=device, dtype=X.dtype) - W @ (WtW_inv @ W.T)
+    PKP = V @ K @ V                                       # K̃ = V K V
+    tr_pkp = torch.trace(PKP)
+    tr_pkp2 = torch.trace(PKP @ PKP)
+    A = torch.stack([
+        torch.stack([tr_pkp2, tr_pkp]),
+        torch.stack([tr_pkp, torch.as_tensor(nc, device=device, dtype=X.dtype)]),
+    ])
+    Ainv = torch.linalg.inv(A)
+
+    def loss(Z: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        Z = Z.to(device, X.dtype)
+        mu = Z.mean(dim=0, keepdim=True)
+        sd = Z.std(dim=0, keepdim=True, unbiased=True).clamp_min(1e-8)
+        Zs = (Z - mu) / sd
+        Q_PKP = Zs.T @ (PKP @ Zs)                         # z_iᵀ K̃ z_j
+        Q_P = Zs.T @ (V @ Zs)                             # z_iᵀ V z_j
+        G = Ainv[0, 0] * Q_PKP + Ainv[0, 1] * Q_P
+        G = 0.5 * (G + G.T)
+        d = torch.sqrt(torch.diagonal(Q_P).clamp_min(1e-12))
+        P_corr = Q_P / (d[:, None] * d[None, :])
+        P_corr = 0.5 * (P_corr + P_corr.T)
+
+        zdim = G.shape[0]
+        P_reg = P_corr + ridge * torch.eye(zdim, device=device, dtype=X.dtype)
+        L = torch.linalg.cholesky(P_reg)
+        Linv = torch.linalg.inv(L)
+        M = Linv @ G @ Linv.T
+        M = 0.5 * (M + M.T)
+        spectrum = torch.linalg.eigvalsh(M).flip(0)       # descending
+        return G, P_corr, spectrum
+
     return loss
 
 
